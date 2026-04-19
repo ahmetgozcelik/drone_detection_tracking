@@ -1,0 +1,41 @@
+# Model dosyaları (büyük binary — git LFS veya ayrı depo)
+models/*.onnx
+models/*.pt
+models/*.tflite
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual environment
+.env
+.venv
+env/
+venv/
+
+# Log dosyaları
+logs/
+*.log
+
+# Hassas veriler (RTSP şifreleri vb.)
+.env.local
+secrets.yaml
+
+# Test verileri (büyük video dosyaları)
+data/samples/*.mp4
+data/samples/*.avi
+
+# IDE
+.vscode/settings.json
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dağıtım
+dist/
+build/
+*.egg-info/

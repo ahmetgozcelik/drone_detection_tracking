@@ -1,0 +1,50 @@
+# Detector Katmanı Kuralları
+# Konum: .cursor/rules/detectors.mdc
+
+---
+description: core/detectors/ altındaki dosyalar için özel kurallar
+globs: ["core/detectors/**/*.py"]
+---
+
+## IDetector Implementasyon Kontrol Listesi
+
+Her `IDetector` implementasyonu şunları ZORUNLU içerir:
+
+```python
+# 1. load() — model dosyası yoksa FileNotFoundError
+def load(self) -> None:
+    if not self._model_path.is_file():
+        raise FileNotFoundError(...)
+
+# 2. detect() — boş liste döner, None dönemez
+def detect(self, frame: np.ndarray) -> list[Detection]:
+    ...
+    return []   # tespit yoksa boş liste
+
+# 3. release() — session/model None'a set edilir
+def release(self) -> None:
+    self._session = None
+```
+
+## Önişleme Standardı
+
+- **Letterbox zorunlu:** Basit `cv2.resize` yasak, en-boy oranı bozulamaz.
+- Gri dolgu değeri: `114` (YOLOv8 standardı).
+- Çıktı format: `NCHW float32 [0,1]`.
+- `pad_left`, `pad_top`, `letterbox_scale` `_postprocess`'e parametre olarak geçer.
+
+## Postprocessing Standardı
+
+- YOLOv8 ONNX çıktısı: `(1, 4+nc, N)` veya `(1, N, 4+nc)` — her ikisi handle edilir.
+- NMS: `cv2.dnn.NMSBoxes` kullanılır, manuel IoU hesabı yapılmaz.
+- `conf_threshold`: `settings["model"]["conf_threshold"]`'dan okunur.
+- `iou_threshold`: `settings["model"]["iou_threshold"]`'dan okunur.
+- Sınıf filtresi: `class_id == DRONE_CLASS_ID` (constants.py).
+- Çıktı bbox formatı: `(x, y, w, h)` — sol üst köşe + genişlik/yükseklik.
+
+## ONNX Runtime Kuralları
+
+- Provider önceliği: CUDA varsa önce, sonra CPU.
+- `intra_op_num_threads`: `settings["performance"]["inference_threads"]`'dan okunur.
+- `SessionOptions` her zaman set edilir.
+- PyTorch import edilmez, `ultralytics` sadece eğitim/export için kullanılır.

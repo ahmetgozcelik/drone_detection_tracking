@@ -1,0 +1,56 @@
+# Git ve Commit Standartları
+# Konum: .cursor/rules/git.mdc
+
+---
+description: Commit mesajı formatı ve dal yönetimi
+globs: ["**/*"]
+---
+
+## Commit Formatı (Conventional Commits)
+
+```
+<tip>(<kapsam>): <başlık>
+
+[opsiyonel gövde]
+
+Refs: <ilgili dosya veya plan maddesi>
+```
+
+### Tip Değerleri
+
+| Tip | Kullanım |
+|-----|----------|
+| `feat` | Yeni dosya veya özellik |
+| `fix` | Hata düzeltme |
+| `refactor` | Davranış değişikliği olmadan yapısal değişim |
+| `chore` | Bağımlılık, config, klasör düzenlemesi |
+| `test` | Test ekleme veya güncelleme |
+| `docs` | Yorum veya dokümantasyon |
+
+### Kapsam Değerleri
+
+`core`, `detectors`, `trackers`, `engine`, `ui`, `infrastructure`, `utils`, `configs`
+
+### Örnekler
+
+```
+feat(detectors): add YoloOnnxDetector with letterbox preprocessing
+fix(trackers): prevent CSRT reinit on periodic YOLO redetect
+refactor(engine): extract snapshot_mode mapping to pure function
+chore(configs): add psutil to requirements.txt
+```
+
+## Dal Stratejisi
+
+```
+master          → Stabil, çalışan sürüm
+feature/ui      → UI geliştirme
+feature/stream  → Stream implementasyonları
+fix/letterbox   → Hata düzeltmeleri
+```
+
+## Her İterasyondan Sonra
+
+1. Dosya çalışıyorsa commit at.
+2. Kırık kod commit edilmez — önce TODO yorum bırak.
+3. Model dosyaları (`.onnx`, `.pt`) commit edilmez → `.gitignore`'a ekli olmalı.

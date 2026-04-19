@@ -1,0 +1,94 @@
+# Drone Tracking System — Cursor Project Rules
+# Bu dosya Cursor'un projeyi her oturumda tutarlı anlaması için yazılmıştır.
+# Konum: .cursor/rules/project.mdc
+
+---
+description: Drone takip sistemi genel mimari ve kodlama kuralları
+globs: ["**/*.py", "**/*.yaml"]
+---
+
+## Proje Kimliği
+
+Bu proje; kısıtlı donanımlarda (Raspberry Pi 4, Jetson Nano) çalışan,
+askeri standartlarda gerçek zamanlı drone tespit ve takip sistemidir.
+ONNX Runtime + OpenCV hibrit mimarisi kullanır.
+
+## Katmanlı Mimari — Kesinlikle Uyulacak
+
+```
+core/interfaces/   → Soyut arayüzler (IDetector, ITracker, IStream)
+core/detectors/    → IDetector implementasyonları
+core/trackers/     → ITracker implementasyonları + HybridTracker
+core/engine/       → SystemController, Pipeline (iş mantığı merkezi)
+infrastructure/    → StreamManager (dış dünya bağlantısı)
+ui/                → Yalnızca görüntüleme, sıfır iş mantığı
+utils/             → logger, metrics (bağımlılık almaz)
+configs/           → settings.yaml + constants.py
+```
+
+**Bağımlılık yönü tek yönlüdür:**
+`ui → engine → trackers/detectors → interfaces`
+`ui → infrastructure → interfaces`
+`hepsi → utils, configs`
+
+Hiçbir katman kendinden üst katmanı import etmez.
+
+## Kodlama Kuralları
+
+### Import
+- Magic number yasak. Tüm sabitler `configs/constants.py`'den alınır.
+- Ayarlar `from configs import settings` ile okunur, hard-code edilmez.
+- Logger: `from utils.logger import get_logger` → `log = get_logger(__name__)`
+
+### Tip Güvenliği
+- Tüm fonksiyon imzaları type hint içerir.
+- `np.ndarray` parametreleri için `from __future__ import annotations` kullanılır.
+- Dataclass'lar `@dataclass` ile tanımlanır, dict döndürülmez.
+
+### Thread Güvenliği
+- UI güncellemeleri yalnızca `pyqtSignal` üzerinden yapılır, doğrudan çağrı yasak.
+- Kuyruk stratejisi: `Queue(maxsize=2)` — yeni kare eskiyi ezer, bloklanmaz.
+- Maksimum 3 thread: Capture, Inference, UI (Qt main thread). Yeni thread açılmaz.
+
+### Hata Yönetimi
+- `load()` metodları `FileNotFoundError` ve `RuntimeError` fırlatır, sessiz geçmez.
+- Her `except` bloğu `log.exception()` ile kaydedilir.
+- Pipeline `stop()` her zaman `finally` bloğu içerir.
+
+### Bellek (Edge Device)
+- Her `N` karede `gc.collect()` çağrılır (`settings["performance"]["gc_interval_frames"]`).
+- RAM limiti: 2 GB (`settings["performance"]["max_ram_mb"]` = 1800).
+- PyTorch import edilmez; yalnızca ONNX Runtime kullanılır.
+
+## Yeni Dosya Eklerken
+
+1. İlgili `__init__.py`'ye export ekle.
+2. `IDetector` / `ITracker` / `IStream` arayüzlerinden birini implemente ediyorsa
+   tüm abstract metodları eksiksiz yaz.
+3. Dosya başına `CURSOR İÇİN BAĞLAM:` bloğu ekle.
+4. `get_logger(__name__)` ile logger al.
+
+## Yasak Kalıplar
+
+```python
+# ❌ Magic number
+if confidence > 0.6:
+
+# ✅ Doğru
+if confidence > settings["model"]["conf_threshold"]:
+
+# ❌ Doğrudan thread'den UI güncelleme
+self.label.setText("...")   # inference thread içinde
+
+# ✅ Sinyal üzerinden
+self.result_signal.emit(result, snapshot)
+
+# ❌ PyTorch import
+import torch
+
+# ❌ Hard-coded path
+model_path = "C:/Users/ahmet/models/yolo.onnx"
+
+# ✅ constants üzerinden
+model_path = ROOT_DIR / settings["model"]["onnx_path"]
+```

@@ -1,0 +1,53 @@
+# ============================================================
+# drone-tracking-system — Dinamik Ayarlar
+# ============================================================
+# Bu dosya runtime'da okunur. Kod değişikliği gerekmez.
+# Tüm sabitler (değişmez değerler) constants.py içindedir.
+# ============================================================
+
+# --- Model & Çıkarım ---
+model:
+  onnx_path: "models/yolov8n.onnx"        # ONNX export sonrası buraya taşı
+  pt_path: "models/yolov8n.pt"            # Ham PyTorch ağırlığı (yedek)
+  input_size: 640                          # YOLO giriş çözünürlüğü (px)
+  conf_threshold: 0.60                     # Tespit güven eşiği (plan.txt: >0.6)
+  iou_threshold: 0.45                      # NMS için IoU eşiği
+
+# --- Hibrit Takip ---
+tracker:
+  mode: "csrt"                             # "csrt" (hassas) | "kcf" (hızlı)
+  fallback_confidence: 0.30               # Bu değerin altında YOLO'ya geri dön
+  redetect_interval: 60                   # Her N karede bir arka planda YOLO çalıştır
+
+# --- Video Kaynakları ---
+stream:
+  default_source: "usb"                   # "usb" | "rtsp" | "file"
+  usb_device_index: 0                     # /dev/video0
+  rtsp_url: ""                            # Örn: rtsp://admin:pass@192.168.1.64/stream1
+  reconnect_attempts: 5                   # Bağlantı kopunca kaç kez dene
+  reconnect_delay_sec: 2.0               # Denemeler arası bekleme (saniye)
+  frame_queue_maxsize: 2                  # Küçük tut → düşük latency (edge device)
+
+# --- Performans & Bellek (Edge Device Kısıtları) ---
+performance:
+  max_ram_mb: 1800                        # target_hardware.txt: 2GB limit, güvenli marj
+  gc_interval_frames: 100                 # Her N karede bir garbage collection tetikle
+  inference_threads: 2                    # ONNX Runtime intra-op thread sayısı
+  # Not: Ana thread sayısı 2-3 olarak sınırlandırıldı (target_hardware.txt)
+
+# --- Loglama ---
+logging:
+  level: "INFO"                           # DEBUG | INFO | WARNING | ERROR
+  log_dir: "logs/"
+  max_file_size_mb: 10
+  backup_count: 3                         # Eski log dosyası tutma sayısı
+  enable_console: true
+
+# --- UI ---
+ui:
+  window_title: "Drone Takip Sistemi"
+  display_fps: true
+  display_latency: true
+  display_coordinates: true
+  bbox_color: [0, 255, 0]                # BGR: Yeşil
+  bbox_thickness: 2

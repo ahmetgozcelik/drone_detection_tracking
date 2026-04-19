@@ -1,0 +1,95 @@
+# UI Katmanı Kuralları
+# Konum: .cursor/rules/ui.mdc
+
+---
+description: ui/ altındaki dosyalar için PyQt5 ve MVVM kuralları
+globs: ["ui/**/*.py"]
+---
+
+## MVVM Zorunluluğu
+
+UI dosyaları **sıfır iş mantığı** içerir.
+
+```python
+# ❌ View içinde iş mantığı — YASAK
+def on_frame(self, frame):
+    if frame.shape[0] > 480:   # bu bir iş kuralı, View'da olamaz
+        ...
+
+# ✅ View sadece gösterir
+def _update_display(self, result: HybridFrameResult, snapshot: MetricsSnapshot):
+    self._render_frame(result)
+    self._update_panels(snapshot)
+```
+
+## Thread Güvenliği — Kırılmaz Kural
+
+```python
+# ❌ Inference thread'den doğrudan UI güncelleme — ÇÖKME garantili
+self.fps_label.setText("30 FPS")   # inference thread içinde
+
+# ✅ Her zaman sinyal üzerinden
+class MainWindow(QMainWindow):
+    result_signal = pyqtSignal(object, object)   # (HybridFrameResult, MetricsSnapshot)
+
+    def __init__(self):
+        self.result_signal.connect(self._update_display)
+
+    def _on_pipeline_result(self, result, snapshot):
+        self.result_signal.emit(result, snapshot)   # thread-safe
+```
+
+## Renk Kodlama Standardı (Askeri)
+
+| Durum | QLabel Arka Plan | Anlam |
+|-------|-----------------|-------|
+| STATUS_TRACK | `#00aa00` (yeşil) | Hedef takip ediliyor |
+| STATUS_DETECT | `#aaaa00` (sarı) | Hedef aranıyor |
+| STATUS_LOST | `#aa0000` (kırmızı) | Hedef kayıp |
+
+```python
+STATUS_COLORS = {
+    STATUS_TRACK:  "background-color: #00aa00; color: white;",
+    STATUS_DETECT: "background-color: #aaaa00; color: black;",
+    STATUS_LOST:   "background-color: #aa0000; color: white;",
+}
+self.status_label.setStyleSheet(STATUS_COLORS[result.status])
+```
+
+## Bbox Çizim Standardı
+
+```python
+# Renk seçimi duruma göre
+COLOR_MAP = {
+    STATUS_TRACK:  COLOR_GREEN,
+    STATUS_DETECT: COLOR_YELLOW,
+    STATUS_LOST:   (0, 0, 100),   # soluk kırmızı — son bilinen konum
+}
+
+# Confidence score bbox üzerine yazılır
+cv2.putText(frame, f"{conf:.2f}", (x, y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1)
+
+# STATUS_LOST'ta son bilinen koordinat etikette kalır (silinmez)
+# "SON: (x, y)" formatında gri renkte gösterilir
+```
+
+## Zorunlu UI Olayları
+
+```python
+def closeEvent(self, event):
+    """Pencere kapanırken pipeline güvenli durdurulur."""
+    log.info("Uygulama kapatılıyor...")
+    if self._pipeline:
+        self._pipeline.stop()
+    log.info("Pipeline durduruldu. Çıkış.")
+    event.accept()
+```
+
+## Kaynak Geçişi
+
+Pipeline çalışırken kaynak değiştirilirse:
+1. Mevcut pipeline durdurulur (`stop()`).
+2. Yeni stream nesnesi oluşturulur.
+3. Yeni pipeline başlatılır (`start()`).
+4. Kullanıcıya `QMessageBox` ile bilgi verilmez — durum etiketi yeterli.
