@@ -125,6 +125,9 @@ class Pipeline:
             self._latency_timer.start()
             try:
                 result = self._controller.process(frame)
+                # TaggedFrame ise camera_id'yi result'a aktar (CompositeStream desteği)
+                if hasattr(frame, "meta"):
+                    result.camera_id = frame.meta.get("camera_id", 0)
             except Exception as e:
                 log.exception("SystemController.process hatası: %s", e)
                 self._latency_timer.stop()

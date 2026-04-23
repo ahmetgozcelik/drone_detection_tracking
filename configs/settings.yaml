@@ -10,7 +10,7 @@ model:
   onnx_path: "models/yolov8n.onnx"        # ONNX export sonrası buraya taşı
   pt_path: "models/yolov8n.pt"            # Ham PyTorch ağırlığı (yedek)
   input_size: 640                          # YOLO giriş çözünürlüğü (px)
-  conf_threshold: 0.60                     # Tespit güven eşiği (plan.txt: >0.6)
+  conf_threshold: 0.45                     # Tespit güven eşiği (plan.txt: >0.6)
   iou_threshold: 0.45                      # NMS için IoU eşiği
 
 # --- Hibrit Takip ---
@@ -22,7 +22,9 @@ tracker:
 # --- Video Kaynakları ---
 stream:
   default_source: "usb"                   # "usb" | "rtsp" | "file"
-  usb_device_index: 0                     # /dev/video0
+  usb_device_indices: [0, 1]             # Çift kamera: [0, 1] → CompositeStream
+                                          # Tek kamera için: usb_device_index: 0
+  usb_device_index: 0                    # Tek kamera geri uyumluluk (kullanılmaz)
   rtsp_url: ""                            # Örn: rtsp://admin:pass@192.168.1.64/stream1
   reconnect_attempts: 5                   # Bağlantı kopunca kaç kez dene
   reconnect_delay_sec: 2.0               # Denemeler arası bekleme (saniye)
@@ -42,6 +44,26 @@ logging:
   max_file_size_mb: 10
   backup_count: 3                         # Eski log dosyası tutma sayısı
   enable_console: true
+
+# --- ESP32 Seri Port (SerialController) ---
+serial:
+  # Port: None → otomatik tespit (CP2102/CH340 VID taraması)
+  # Linux: /dev/ttyUSB0  |  macOS: /dev/cu.SLAB_USBtoUART  |  Windows: COM3
+  port: null                              # null = otomatik tespit
+  baudrate: 115200                        # ESP32 firmware ile eşleşmeli
+  timeout_ms: 100                         # Read/write timeout (milisaniye)
+  reconnect_attempts: 5                   # Bağlantı kopunca kaç kez dene
+  enabled: true                           # false → servo komutları yalnızca loglanır
+
+# --- Sektör Yönetimi (SectorManager) ---
+sectors:
+  camera_count: 2
+  camera_fov_deg: 120.0                   # Her kameranın yatay FOV'u (derece)
+  camera_mount_angles: [0.0, 180.0]       # Kamera montaj açıları (Cam A=ön, Cam B=arka)
+  pan_range_deg: [-60.0, 60.0]            # Pan servo hareket aralığı
+  tilt_range_deg: [0.0, 60.0]             # Tilt servo hareket aralığı (0=yatay, 60=yukarı)
+  sweep_enabled: true                     # Drone yokken pan tarama aktif mi
+  sweep_period_sec: 4.0                   # Tam ileri-geri tarama süresi (saniye)
 
 # --- UI ---
 ui:

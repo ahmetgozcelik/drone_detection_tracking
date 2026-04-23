@@ -20,9 +20,18 @@ log = get_logger(__name__)
 
 @dataclass
 class HybridFrameResult:
-    """Tek karelik hibrit çıktı: bbox + UI durum metni (constants.STATUS_*)."""
+    """
+    Tek karelik hibrit çıktı: bbox + UI durum metni (constants.STATUS_*).
+
+    Attributes:
+        bbox:      (x, y, w, h) piksel koordinatları. Tespit yoksa (0,0,0,0).
+        status:    constants.STATUS_DETECT / TRACK / LOST
+        camera_id: Karenin alındığı kamera kimliği (CompositeStream için 0/1).
+                   Tek kamera modunda daima 0.
+    """
     bbox: tuple[int, int, int, int]
     status: str
+    camera_id: int = 0
 
 
 class HybridTracker:

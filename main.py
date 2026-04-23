@@ -162,9 +162,33 @@ def main() -> int:
     app.setApplicationName("Drone Takip Sistemi")
     app.setOrganizationName("OSTİM Teknik Üniversitesi")
 
+    # ── Donanım Katmanı — Dependency Injection ──────────────────────────────
+    # SerialController ve SectorManager QApplication'dan sonra, MainWindow'dan
+    # önce oluşturulur. MainWindow ve Pipeline bunları arayüzleri üzerinden bilir.
+
+    from configs import settings as _s
+    from infrastructure.serial_controller import SerialController
+    from core.engine.sector_manager import SectorManager
+
+    serial_ctrl: SerialController | None = None
+    serial_cfg = _s.get("serial", {})
+    if serial_cfg.get("enabled", True):
+        serial_ctrl = SerialController()
+        if not serial_ctrl.connect():
+            log.warning(
+                "SerialController: ESP32 bağlantısı kurulamadı. "
+                "Servo kontrolü devre dışı (simülasyon modu)."
+            )
+            serial_ctrl = None  # Bağlantısız controller yerine None ilet
+    else:
+        log.info("SerialController: settings.yaml → serial.enabled=false, atlandı.")
+
+    sector_manager = SectorManager(serial_controller=serial_ctrl)
+    log.info("SectorManager oluşturuldu: %s", sector_manager)
+
     # Ana pencere — Pipeline burada başlamaz; kullanıcı kaynak seçince başlar
     from ui.main_window import MainWindow
-    window = MainWindow()
+    window = MainWindow(sector_manager=sector_manager)
     window.show()
 
     log.info("Ana pencere gösterildi. Kullanıcı etkileşimi bekleniyor.")

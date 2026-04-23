@@ -49,20 +49,22 @@ class CsrtTracker(ITracker):
             log.debug("CSRT init başarılı. bbox=%s", bbox)
             return True
         except Exception as e:
-            log.warning("CSRT init başarısız. bbox=%s | hata=%s", bbox, e)
+            log.warning("CSRT init exception. bbox=%s | %s", bbox, e)
             self._tracker = None
             return False
 
     def update(self, frame: np.ndarray) -> TrackResult:
         if self._tracker is None:
             return TrackResult(success=False, bbox=(0, 0, 0, 0))
-
-        ok, box = self._tracker.update(frame)
-        if not ok or box is None:
+        try:
+            ok, box = self._tracker.update(frame)
+            if not ok or box is None:
+                return TrackResult(success=False, bbox=(0, 0, 0, 0))
+            x, y, w, h = (int(v) for v in box)
+            return TrackResult(success=True, bbox=(x, y, w, h), confidence=1.0)
+        except Exception as e:
+            log.warning("CSRT update exception: %s", e)
             return TrackResult(success=False, bbox=(0, 0, 0, 0))
-
-        x, y, w, h = (int(v) for v in box)
-        return TrackResult(success=True, bbox=(x, y, w, h), confidence=1.0)
 
     def reset(self) -> None:
         self._tracker = None
@@ -93,7 +95,7 @@ class KcfTracker(ITracker):
             log.debug("KCF init başarılı. bbox=%s", bbox)
             return True
         except Exception as e:
-            log.warning("KCF init başarısız. bbox=%s | hata=%s", bbox, e)
+            log.warning("KCF init exception. bbox=%s | %s", bbox, e)
             self._tracker = None
             return False
 
@@ -107,7 +109,7 @@ class KcfTracker(ITracker):
             x, y, w, h = (int(v) for v in box)
             return TrackResult(success=True, bbox=(x, y, w, h), confidence=1.0)
         except Exception as e:
-            log.warning("CSRT update hatası: %s", e)
+            log.warning("KCF update exception: %s", e)
             return TrackResult(success=False, bbox=(0, 0, 0, 0))
 
     def reset(self) -> None:
