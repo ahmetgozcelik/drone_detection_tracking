@@ -39,13 +39,15 @@ from PyQt5.QtWidgets import (
 
 from configs import settings
 from configs.constants import (
+    CLR_BTN_PRESSED,
     COLOR_GREEN,
+    COLOR_LABEL_MUTED,
+    COLOR_LOST_HINT,
     COLOR_WHITE,
     COLOR_YELLOW,
     STATUS_IDLE,
 )
 from core.engine.sector_manager import SectorManager
-from core.interfaces import IStream
 from ui.viewmodels.main_viewmodel import (
     CLR_BADGE,
     MainViewModel,
@@ -75,10 +77,26 @@ FONT_MONO = "Consolas, 'Courier New', monospace"
 _BBOX_KEY_BGR: dict[str, tuple[int, int, int]] = {
     "track":  COLOR_GREEN,
     "detect": COLOR_YELLOW,
-    "lost_hint": (0, 0, 100),
+    "lost_hint": COLOR_LOST_HINT,
 }
 
 _BBOX_THICKNESS: int = int(settings.get("ui", {}).get("bbox_thickness", 2))
+
+
+def _bbox_top_left_for_cv2(
+    bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """
+    ``cv2.rectangle`` sol-üst (x, y) ister. Motor ``topleft`` (OpenCV) veya
+    merkez [cx, cy, w, h] dönen yollar için ``draw_bbox_convention`` ile
+    ayrıştırma (hizalı yeşil kutu, merkez/sol-üst karışımını önler).
+    """
+    if str(
+        settings.get("ui", {}).get("draw_bbox_convention", "topleft"),
+    ).lower() == "center":
+        cx, cy, w, h = bbox
+        return (int(cx - w / 2.0), int(cy - h / 2.0), int(w), int(h))
+    return bbox
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -155,12 +173,13 @@ class MainWindow(QMainWindow):
         self._sector_manager: SectorManager | None = sector_manager
 
         # SectorManager'dan pan/tilt güncellemelerini UI'ya aktar
-        if self._sector_manager is not None:
-            self._sector_manager._on_pan_tilt_update = self._on_servo_update
-
         self._build_ui()
         self._apply_global_style()
         self._view_model.state_ready.connect(self._on_view_state)
+        self._view_model.servo_updated.connect(self._on_servo_update)
+        self._view_model.pipeline_error.connect(
+            lambda msg: QMessageBox.critical(self, "Hata", msg),
+        )
         self._set_badge_idle()
         self._set_connection(False, "BAGLANTI YOK")
 
@@ -196,7 +215,7 @@ class MainWindow(QMainWindow):
                 color: {CLR_BG};
             }}
             QPushButton:pressed {{
-                background-color: #006b88;
+                background-color: {CLR_BTN_PRESSED};
                 color: {CLR_BG};
             }}
             QPushButton:disabled {{
@@ -469,23 +488,13 @@ class MainWindow(QMainWindow):
     # ── Servo Güncelleme Callback (SectorManager → UI) ──────────────────────
     def _on_servo_update(self, pan_deg: float, tilt_deg: float, mode: str) -> None:
         """
-        SectorManager'ın on_pan_tilt_update callback'i.
-        Inference thread'den çağrılır → pyqtSignal ile ana thread'e aktar.
+        ViewModel ``servo_updated`` (SectorManager artık inference'dan doğrudan
+        widget'a yazmaz).
         """
-        # MetricRow.set_value thread-safe değil; pyqtSignal gerekir.
-        # Basit çözüm: set_value paintEvent tetikler, Qt thread-safe paintEvent sıralar.
+        # set_value sadece UI thread'de; sinyal zaten buraya bağlı.
         self._row_pan.set_value(f"{pan_deg:.1f}")
         self._row_tilt.set_value(f"{tilt_deg:.1f}")
         self._row_sw_mode.set_value(mode)
-
-    def _start_pipeline(self, stream: IStream) -> None:
-        ok = self._view_model.start_pipeline(
-            stream, self._sector_manager, self,
-        )
-        if ok:
-            self._set_connection(True, "AKTIF")
-        else:
-            self._set_connection(False, "BAGLANTI BASARISIZ")
 
     def _stop_pipeline(self) -> None:
         self._view_model.stop_pipeline()
@@ -500,9 +509,11 @@ class MainWindow(QMainWindow):
         if not path:
             return
         log.info("Dosya secildi: %s", path)
-        from infrastructure.streams.file_stream import FileStream
-        stream: IStream = FileStream(path)
-        self._start_pipeline(stream)
+        ok = self._view_model.open_file_stream(path, self._sector_manager)
+        if ok:
+            self._set_connection(True, "AKTIF")
+        else:
+            self._set_connection(False, "BAGLANTI BASARISIZ")
 
     def _on_connect_camera(self) -> None:
         cfg = settings.get("stream", {})
@@ -510,43 +521,32 @@ class MainWindow(QMainWindow):
         log.info("Kamera baglantısı istendi. Kaynak: %s", source)
 
         if source == "usb":
-            from infrastructure.streams.usb_stream import UsbStream
-
-            indices = cfg.get("usb_device_indices", None)
-            if indices and len(indices) > 1:
-                # Çift kamera: CompositeStream (round-robin + TaggedFrame)
-                from infrastructure.streams.composite_stream import CompositeStream
-                streams = [UsbStream(int(i)) for i in indices]
-                stream: IStream = CompositeStream(streams)
-                log.info("CompositeStream oluşturuldu: %d kamera %s", len(indices), indices)
+            log.info("Composite/Usb akışı ViewModel üzerinden.")
+            ok = self._view_model.open_camera_stream(cfg, self._sector_manager)
+            if ok:
+                self._set_connection(True, "AKTIF")
+                indices = cfg.get("usb_device_indices", None)
+                if self._sector_manager is not None:
+                    self._row_cam.set_value(
+                        f"{len(indices) if indices and len(indices) > 1 else 1}"
+                    )
             else:
-                device_idx = int(cfg.get("usb_device_index", 0))
-                stream = UsbStream(device_idx)
-
-            self._start_pipeline(stream)
-
-            # Aktif kamera göstergesini güncelle
-            if self._sector_manager is not None:
-                self._row_cam.set_value(
-                    f"{len(indices) if indices and len(indices) > 1 else 1}"
-                )
-
+                self._set_connection(False, "BAGLANTI BASARISIZ")
         elif source == "rtsp":
             url = cfg.get("rtsp_url", "")
-            if not url:
-                url, ok = QInputDialog.getText(
+            if not str(url or "").strip():
+                url, okd = QInputDialog.getText(
                     self, "RTSP URL", "Kamera akış adresini girin:",
                 )
-                if not ok or not url.strip():
+                if not okd or not str(url).strip():
                     return
-            # TODO: RtspStream implementasyonu tamamlandığında aktif et
-            # from infrastructure.streams.rtsp_stream import RtspStream
-            # stream: IStream = RtspStream(url.strip())
-            # self._start_pipeline(stream)
-            QMessageBox.information(self, "Bilgi", "RtspStream henüz implemente edilmedi.")
-
+            cfg2 = {**cfg, "rtsp_url": str(url).strip()}
+            ok = self._view_model.open_camera_stream(cfg2, self._sector_manager)
+            if not ok:
+                self._set_connection(False, "BAGLANTI BASARISIZ")
         else:
-            QMessageBox.critical(self, "Hata", f"Bilinmeyen kaynak tipi: {source}")
+            self._view_model.open_camera_stream(cfg, self._sector_manager)
+            self._set_connection(False, "BAGLANTI BASARISIZ")
 
     # ── ViewModel sinyali → UI (ana thread) ─────────────────────────────────
     def _on_view_state(self, state: object, frame: object) -> None:
@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
                 if not isinstance(L, ViewTrackLayer):
                     continue
                 color = _BBOX_KEY_BGR.get(L.color_key, COLOR_GREEN)
-                x, y, w, h = L.bbox
+                x, y, w, h = _bbox_top_left_for_cv2(L.bbox)
                 cv2.rectangle(vis, (x, y), (x + w, y + h), color, _BBOX_THICKNESS)
                 cv2.putText(
                     vis,
@@ -589,7 +589,7 @@ class MainWindow(QMainWindow):
         vis = frame.copy()
         if spec.show_primary_bbox:
             color = _BBOX_KEY_BGR.get(spec.primary_color_key, COLOR_GREEN)
-            x, y, w, h = spec.bbox
+            x, y, w, h = _bbox_top_left_for_cv2(spec.bbox)
             cv2.rectangle(vis, (x, y), (x + w, y + h), color, _BBOX_THICKNESS)
             cv2.putText(
                 vis,
@@ -598,13 +598,13 @@ class MainWindow(QMainWindow):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1, cv2.LINE_AA,
             )
         elif spec.show_last_known:
-            x, y, w, h = spec.last_known_bbox
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 100), _BBOX_THICKNESS)
+            x, y, w, h = _bbox_top_left_for_cv2(spec.last_known_bbox)
+            cv2.rectangle(vis, (x, y), (x + w, y + h), COLOR_LOST_HINT, _BBOX_THICKNESS)
             cv2.putText(
                 vis,
                 spec.label_text,
                 (x, max(y - 6, 12)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_LABEL_MUTED, 1, cv2.LINE_AA,
             )
         return vis
 

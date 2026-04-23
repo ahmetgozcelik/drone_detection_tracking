@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
+
 from configs import settings
 from configs.constants import STATUS_LOST
 from core.interfaces.idetector import Detection, IDetector
@@ -19,35 +23,11 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
-def _box_iou(
-    a: tuple[int, int, int, int], b: tuple[int, int, int, int],
-) -> float:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    a_x2, a_y2 = ax + aw, ay + ah
-    b_x2, b_y2 = bx + bw, by + bh
-    ix0, iy0 = max(ax, bx), max(ay, by)
-    ix1, iy1 = min(a_x2, b_x2), min(a_y2, b_y2)
-    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
-    inter = float(iw * ih)
-    if inter <= 0.0:
-        return 0.0
-    u = float(aw * ah + bw * bh) - inter
-    return inter / u if u > 0.0 else 0.0
-
-
 def _centroid(
     b: tuple[int, int, int, int],
 ) -> tuple[float, float]:
     x, y, w, h = b
     return (x + w / 2.0, y + h / 2.0)
-
-
-def _centroid_dist(
-    a: tuple[int, int, int, int], b: tuple[int, int, int, int],
-) -> float:
-    ca, cb = _centroid(a), _centroid(b)
-    return float(math.hypot(ca[0] - cb[0], ca[1] - cb[1]))
 
 
 class TrackerPool:
@@ -65,8 +45,10 @@ class TrackerPool:
         self._lost_streak: dict[str, int] = {}
 
         tcfg = settings.get("tracker", {})
-        self._match_iou: float = float(tcfg.get("mot_match_iou", 0.12))
-        self._match_centroid_max_px: float = float(tcfg.get("mot_match_centroid_max_px", 180.0))
+        # mot_match_iou / mot_match_centroid_max_px: geriye uyum (eski config)
+        self._hungarian_max_dist_px: float = float(
+            tcfg.get("mot_hungarian_max_dist_px", 200.0),
+        )
         self._lost_remove: int = int(tcfg.get("mot_lost_remove_frames", 45))
         self._max_tracks: int = int(tcfg.get("mot_max_tracks", 8))
 
@@ -84,49 +66,50 @@ class TrackerPool:
         self,
         dets: list[Detection],
     ) -> tuple[dict[str, Detection], list[Detection]]:
+        """
+        Macar algoritması: izleyici / tespit merkez mesafeleri (euclidean).
+        Eşik üstü çiftler maliyet matrisinde maskelenir.
+        """
         tids = list(self._trackers.keys())
         if not tids or not dets:
             return {}, list(dets)
-        used_t, used_d = set(), set()
+
+        anchors: list[tuple[int, int, int, int]] = []
+        valid_tids: list[str] = []
+        for tid in tids:
+            anc = self._anchor(tid)
+            if anc == (0, 0, 0, 0):
+                continue
+            valid_tids.append(tid)
+            anchors.append(anc)
+        if not valid_tids:
+            return {}, list(dets)
+
+        t_cent = np.array([_centroid(b) for b in anchors], dtype=np.float64)
+        d_cent = np.array(
+            [_centroid(d.bbox) for d in dets],
+            dtype=np.float64,
+        )
+        cost = cdist(t_cent, d_cent, metric="euclidean")
+        high = float(self._hungarian_max_dist_px)
+        big = 1e9
+        cost[cost > high] = big
+
+        row_ind, col_ind = linear_sum_assignment(cost)
         out: dict[str, Detection] = {}
-
-        pairs: list[tuple[float, int, int, int]] = []  # (score desc, is_iou, tid_idx, det_idx)
-        for di, d in enumerate(dets):
-            for tii, tid in enumerate(tids):
-                anc = self._anchor(tid)
-                if anc == (0, 0, 0, 0):
-                    continue
-                iouv = _box_iou(anc, d.bbox)
-                if iouv >= self._match_iou:
-                    pairs.append((iouv, 1, tii, di))
-        pairs.sort(key=lambda p: p[0], reverse=True)
-        for score, _is_iou, tii, di in pairs:
-            tid = tids[tii]
-            if tid in used_t or di in used_d:
+        used_d: set[int] = set()
+        for ri, ci in zip(row_ind, col_ind):
+            if cost[ri, ci] >= big * 0.5:
                 continue
-            out[tid] = dets[di]
-            used_t.add(tid)
-            used_d.add(di)
-
-        cands: list[tuple[float, int, int]] = []
-        for di, d in enumerate(dets):
-            if di in used_d:
+            tid = valid_tids[ri]
+            d = dets[ci]
+            anc = self._anchor(tid)
+            ca, cb = _centroid(anc), _centroid(d.bbox)
+            dist = float(math.hypot(ca[0] - cb[0], ca[1] - cb[1]))
+            if dist > self._hungarian_max_dist_px + 0.1:
                 continue
-            for tii, tid in enumerate(tids):
-                if tid in out:
-                    continue
-                anc = self._anchor(tid)
-                if anc == (0, 0, 0, 0):
-                    continue
-                cands.append((_centroid_dist(anc, d.bbox), tii, di))
-        cands.sort(key=lambda p: p[0])
-        for dist, tii, di in cands:
-            tid = tids[tii]
-            if tid in out or di in used_d or dist > self._match_centroid_max_px:
-                continue
-            out[tid] = dets[di]
-            used_t.add(tid)
-            used_d.add(di)
+            out[tid] = d
+            used_d.add(ci)
 
         remaining = [d for i, d in enumerate(dets) if i not in used_d]
         return out, remaining
@@ -157,7 +140,12 @@ class TrackerPool:
         self._lost_streak.pop(tid, None)
         log.info("Havuz: hedef kaldırıldı: %s", tid)
 
-    def process(self, frame: np.ndarray, camera_id: int = 0) -> HybridFrameResult:
+    def process(
+        self,
+        frame: np.ndarray,
+        camera_id: int = 0,
+        latency_ms: float = 0.0,
+    ) -> HybridFrameResult:
         dets: list[Detection] = self._detector.detect(frame)
         if not dets and not self._trackers:
             return HybridFrameResult([], camera_id=camera_id)
@@ -172,6 +160,7 @@ class TrackerPool:
                 shared_detections=dets,
                 assigned=asg,
                 camera_id=camera_id,
+                latency_ms=latency_ms,
             )
             for t in r.targets:
                 all_targets.append(t)
@@ -188,6 +177,7 @@ class TrackerPool:
                 shared_detections=dets,
                 assigned=det,
                 camera_id=camera_id,
+                latency_ms=latency_ms,
             )
             for t in r.targets:
                 all_targets.append(t)

@@ -62,9 +62,14 @@ class Pipeline:
         self._inference_stop = threading.Event()
         self._inference_thread: threading.Thread | None = None
         self._started = False
+        # Bir önceki kare gecikmesi (EWM) — ileri kestirim için sonraki kareye taşınır
+        self._ewm_latency_ms: float = 0.0
 
         perf = settings.get("performance", {})
         self._gc_interval_frames: int = int(perf.get("gc_interval_frames", 100))
+        self._inference_join_timeout_sec: float = float(
+            perf.get("inference_join_timeout_sec", 10.0),
+        )
 
         self._fps_meter    = FpsMeter(window=30)
         self._latency_timer = LatencyTimer()
@@ -75,6 +80,7 @@ class Pipeline:
             log.warning("Pipeline zaten başlatılmış.")
             return
 
+        self._ewm_latency_ms = 0.0
         self._controller = SystemController.build_default()
         self._controller.load()
 
@@ -112,7 +118,7 @@ class Pipeline:
                 self._stream_manager = None
             _drain_frame_queue("üretici durdu")
             if self._inference_thread is not None and self._inference_thread.is_alive():
-                self._inference_thread.join(timeout=10.0)
+                self._inference_thread.join(timeout=self._inference_join_timeout_sec)
                 if self._inference_thread.is_alive():
                     log.warning("Inference thread zaman aşımında sonlandı.")
         finally:
@@ -137,6 +143,7 @@ class Pipeline:
     def _inference_loop(self) -> None:
         processed = 0
         assert self._controller is not None
+        ewm_alpha = 0.1  # yeni örnek ağırlığı; ani sıçramaları yumuşat
 
         while not self._inference_stop.is_set():
             try:
@@ -145,8 +152,9 @@ class Pipeline:
                 continue
 
             self._latency_timer.start()
+            use_latency = self._ewm_latency_ms
             try:
-                result = self._controller.process(frame)
+                result = self._controller.process(frame, latency_ms=use_latency)
                 # TaggedFrame ise camera_id'yi result'a aktar (CompositeStream desteği)
                 if hasattr(frame, "meta"):
                     result.camera_id = frame.meta.get("camera_id", 0)
@@ -155,6 +163,9 @@ class Pipeline:
                 self._latency_timer.stop()
                 continue
             latency_ms = self._latency_timer.stop()
+            self._ewm_latency_ms = (1.0 - ewm_alpha) * self._ewm_latency_ms + ewm_alpha * float(
+                latency_ms,
+            )
 
             self._fps_meter.tick()
             processed += 1

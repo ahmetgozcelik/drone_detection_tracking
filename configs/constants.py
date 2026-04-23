@@ -34,13 +34,22 @@ TRACKER_CSRT    = "csrt"
 # ── Thread & Kuyruk ─────────────────────────────────────────────────────────
 CAPTURE_THREAD_NAME   = "CaptureThread"
 INFERENCE_THREAD_NAME = "InferenceThread"
-QUEUE_MAXSIZE         = 2       # Düşük tut → frame drop yerine güncel kare işle
+QUEUE_MAXSIZE         = 1       # Sıfır gecikme: yalnızca en son kare (keep-latest)
+
+# --- Kalman (merkez tabanlı durum) — hız sınırlandırma (kutu sapanını önler) ---
+KALMAN_CLAMP_DXY_PX   = 50.0    # 1 karede merkez hız sınırı (piksel)
+KALMAN_CLAMP_DWH_PX   = 30.0    # w/h değişim hız sınırı
 
 # ── Renk Sabitleri (BGR) ────────────────────────────────────────────────────
 COLOR_GREEN  = (0, 255, 0)       # Tespit / aktif takip bbox
 COLOR_YELLOW = (0, 255, 255)     # Takip devam ediyor (düşük güven)
 COLOR_RED    = (0, 0, 255)       # Takip kaybedildi
 COLOR_WHITE  = (255, 255, 255)   # Metin
+COLOR_LOST_HINT   = (0, 0, 100)      # ui.mdc: son bilinen konum gri kutu
+COLOR_LABEL_MUTED = (128, 128, 128)  # KAYIP son konum etiketi (BGR)
+
+# ── UI hex (QSS / inline) — askeri HMI ile uyumlu (.cursor/rules/ui.mdc) ───
+CLR_BTN_PRESSED = "#006b88"      # QPushButton:pressed (koyu vurgu)
 
 # ── UI Metin Şablonları ──────────────────────────────────────────────────────
 FPS_LABEL       = "FPS: {:.1f}"

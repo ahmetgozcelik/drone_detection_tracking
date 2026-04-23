@@ -18,13 +18,15 @@ tracker:
   mode: "csrt"                             # "csrt" (hassas) | "kcf" (hızlı)
   fallback_confidence: 0.30               # Bu değerin altında YOLO'ya geri dön
   redetect_interval: 60                   # Her N karede bir arka planda YOLO çalıştır
-  # TrackerPool (çoklu hedef) — açık sürüm, OpenCV + IoU/merkez
-  mot_match_iou: 0.12                      # Tespit–izleyici eşleşmesi minimum IoU
-  mot_match_centroid_max_px: 180.0         # IoU yoksa merkez mesafesi yedeği
-  mot_lost_remove_frames: 45                # Uzun süre kayıp → izleyiciyi kaldır
-  mot_max_tracks: 8                        # Aynı anda en fazla hedef
-  # Kalman hareket kestirimi (hibrit; OpenCV ölçüm birleşimi)
-  kalman_min_tracker_conf: 0.25            # OpenCV/CSRT ölçümünü Kalman ile düzeltmek için min. güven
+  # TrackerPool: SciPy Macar (centroid) + eski eşleşme (geriye uyum)
+  mot_match_iou: 0.12
+  mot_match_centroid_max_px: 180.0
+  mot_hungarian_max_dist_px: 150.0         # Macar: aşım = sahte eşleşme / ghost hız
+  mot_lost_remove_frames: 45
+  mot_max_tracks: 8
+  kalman_min_tracker_conf: 0.25
+  # Hibrit kurtarma: YOLO yokken KCF (maks. N kare) — hibrit asenkron takip
+  kcf_fallback_max_frames: 5
 
 # --- Video Kaynakları ---
 stream:
@@ -35,13 +37,16 @@ stream:
   rtsp_url: ""                            # Örn: rtsp://admin:pass@192.168.1.64/stream1
   reconnect_attempts: 5                   # Bağlantı kopunca kaç kez dene
   reconnect_delay_sec: 2.0               # Denemeler arası bekleme (saniye)
-  frame_queue_maxsize: 2                  # Küçük tut → düşük latency (edge device)
+  frame_queue_maxsize: 1                  # Belgelik; asıl sabit: constants.QUEUE_MAXSIZE
+  target_fps: 30.0                         # Kalman predict_forward: kare süresi (ms) referansı
 
 # --- Performans & Bellek (Edge Device Kısıtları) ---
 performance:
   max_ram_mb: 1800                        # target_hardware.txt: 2GB limit, güvenli marj
   gc_interval_frames: 100                 # Her N karede bir garbage collection tetikle
   inference_threads: 2                    # ONNX Runtime intra-op thread sayısı
+  inference_join_timeout_sec: 10.0         # pipeline.py: inference thread join
+  stream_manager_join_timeout_sec: 5.0   # (ileride) StreamManager.join için belge
   # Not: Ana thread sayısı 2-3 olarak sınırlandırıldı (target_hardware.txt)
 
 # --- Loglama ---
@@ -78,5 +83,7 @@ ui:
   display_fps: true
   display_latency: true
   display_coordinates: true
+  # overlay bbox: topleft = OpenCV (x,y sol üst) | center = (cx, cy) merkez + w,h
+  draw_bbox_convention: "topleft"
   bbox_color: [0, 255, 0]                # BGR: Yeşil
   bbox_thickness: 2

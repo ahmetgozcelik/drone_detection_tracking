@@ -11,7 +11,6 @@ from dataclasses import dataclass
 
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
-from PyQt5.QtWidgets import QMessageBox, QWidget
 
 from configs.constants import (
     STATUS_DETECT,
@@ -84,6 +83,9 @@ class MainViewModel(QObject):
     state_ready = pyqtSignal(object, object)  # ViewDisplayState, frame (ndarray)
     # Inference thread → biçimlendirme (QueuedConnection, ana thread)
     pipe_result = pyqtSignal(object, object, object)  # frame, HybridFrameResult, MetricsSnapshot
+    # SectorManager (inference) → View (yalnızca UI thread’de rozet)
+    servo_updated = pyqtSignal(float, float, str)
+    pipeline_error = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -128,12 +130,14 @@ class MainViewModel(QObject):
         self,
         stream: IStream,
         sector_manager: SectorManager | None,
-        parent: QWidget,
     ) -> bool:
-        """View'dan istenen akış: öncekini durdur, ``Pipeline`` oluştur ve başlat. Başarı: True."""
+        """Hibrit asenkron akış: öncekini durdur, ``Pipeline`` oluştur ve başlat."""
         self.stop_pipeline()
         if sector_manager is not None:
             sm = sector_manager
+            sm._on_pan_tilt_update = (
+                lambda p, t, m: self.servo_updated.emit(p, t, m)
+            )
 
             def _on_result(
                 frame: object, result: object, snap: object,
@@ -148,15 +152,43 @@ class MainViewModel(QObject):
         self._pipeline = Pipeline(stream=stream, on_result=on_result)
         try:
             self._pipeline.start()
-        except Exception as exc:  # noqa: BLE001 — kullanıcıya rapor
+        except Exception as exc:  # noqa: BLE001
             log.exception("Pipeline baslatılamadı: %s", exc)
-            QMessageBox.critical(
-                parent, "Hata", f"Pipeline baslatılamadı:\n{exc}",
-            )
+            self.pipeline_error.emit(f"Pipeline baslatılamadı:\n{exc}")
             self._pipeline = None
             return False
         log.info("Pipeline baslatıldı (ViewModel).")
         return True
+
+    def open_file_stream(self, path: str, sector_manager: SectorManager | None) -> bool:
+        """``FileStream`` ile başlat; iş mantığı View’da değil."""
+        from infrastructure.streams.file_stream import FileStream
+
+        return self.start_pipeline(FileStream(path), sector_manager)
+
+    def open_camera_stream(
+        self, source_cfg: dict, sector_manager: SectorManager | None,
+    ) -> bool:
+        """``settings`` stream bölümü: USB/Composite veya (ileride) RTSP."""
+        sc = source_cfg
+        source = sc.get("default_source", "usb")
+        if source == "usb":
+            from infrastructure.streams.composite_stream import CompositeStream
+            from infrastructure.streams.usb_stream import UsbStream
+
+            indices = sc.get("usb_device_indices", None)
+            if indices and len(indices) > 1:
+                streams = [UsbStream(int(i)) for i in indices]
+                stream: IStream = CompositeStream(streams)
+            else:
+                device_idx = int(sc.get("usb_device_index", 0))
+                stream = UsbStream(device_idx)
+            return self.start_pipeline(stream, sector_manager)
+        if source == "rtsp":
+            self.pipeline_error.emit("RtspStream henüz implemente edilmedi.")
+            return False
+        self.pipeline_error.emit(f"Bilinmeyen kaynak tipi: {source}")
+        return False
 
     def stop_pipeline(self) -> None:
         if self._pipeline is not None:

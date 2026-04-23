@@ -27,11 +27,12 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# Exponential backoff üst sınırı; jitter sürü etkisini (thundering herd) azaltır
-_MAX_BACKOFF_SEC = 30.0
-# Bekleme süresine 10–%20 rastgele çarpan (0.80–1.0 → en fazla %20 salınım)
+# Yeniden bağlanma: 1s, 2s, 4s… üst sınır 15s; jitter sürü etkisini (thundering herd) azaltır
+_MAX_BACKOFF_SEC = 15.0
 _JITTER_MIN = 0.80
 _JITTER_MAX = 1.0
+# Taban: 1.0^s → 1, 2, 4, 8…
+_BACKOFF_BASE_SEC = 1.0
 
 
 class StreamManager:
@@ -45,6 +46,11 @@ class StreamManager:
     """
 
     def __init__(self, stream: IStream, frame_queue: Queue) -> None:
+        if frame_queue.maxsize != 1:
+            log.warning(
+                "Kuyruk maxsize=%s; hibrit asenkron Sıfır Gecikme için 1 olmalı (constants.QUEUE_MAXSIZE).",
+                frame_queue.maxsize,
+            )
         self._stream       = stream
         self._queue        = frame_queue
         self._stop_event   = threading.Event()
@@ -57,6 +63,10 @@ class StreamManager:
         cfg = settings.get("stream", {})
         self._reconnect_attempts: int   = cfg.get("reconnect_attempts", 5)
         self._reconnect_delay:    float = cfg.get("reconnect_delay_sec", 2.0)
+        perf = settings.get("performance", {})
+        self._thread_join_timeout_sec: float = float(
+            perf.get("stream_manager_join_timeout_sec", 5.0),
+        )
 
     # ── Genel API ────────────────────────────────────────────────────────────
 
@@ -72,7 +82,7 @@ class StreamManager:
         """
         log.info("StreamManager durduruluyor...")
         self._stop_event.set()
-        self._thread.join(timeout=5.0)
+        self._thread.join(timeout=self._thread_join_timeout_sec)
         self._stream.release()
         log.info("StreamManager durduruldu.")
 
@@ -114,23 +124,26 @@ class StreamManager:
                     break
                 continue
 
-            # Kuyruğa eklemeyi dene; dolu ise eski kareyi at (güncel kare öncelikli)
-            # Bu sayede inference thread her zaman en son kareyi işler.
+            # Sıfır gecikme: kuyruk daima 1; doluysa eski kare acımasızca at, en güncel kareyi koy
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 self._queue.put_nowait(frame)
             except Full:
                 try:
-                    self._queue.get_nowait()   # En eski kareyi çıkar
+                    self._queue.get_nowait()
                     self._queue.put_nowait(frame)
-                except Exception:
-                    pass                        # Yarış durumu; kareyi atla
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _open_with_retry(self) -> bool:
         """
         Akışı açmayı settings'teki parametrelerle yeniden dene.
 
-        Exponential backoff (``reconnect_delay`` × 2^n, tavan 30 s) ve
-        %10–%20 jitter (``random.uniform``) ile bekleme.
+        Exponential backoff: taban 1s, 2s, 4s… tavan 15s; rastgele jitter ile bekleme.
 
         Returns:
             True: Bağlantı başarılı.
@@ -146,15 +159,14 @@ class StreamManager:
                 return True
 
             if attempt < self._reconnect_attempts:
-                # Exponential backoff: reconnect_delay, 2x, 4x, ... (üst sınır 30 s)
-                exp_delay = self._reconnect_delay * (2.0 ** (attempt - 1))
+                exp_delay = _BACKOFF_BASE_SEC * (2.0 ** (attempt - 1))
                 capped = min(_MAX_BACKOFF_SEC, exp_delay)
                 jittered = capped * random.uniform(_JITTER_MIN, _JITTER_MAX)
                 if jittered > 0:
                     log.info(
-                        "Bekleme: %.2f s (üst: %.1f, deneme %d sonrası)",
+                        "Bekleme: %.2f s (tavan %.1f s, deneme %d sonrası)",
                         jittered,
-                        capped,
+                        _MAX_BACKOFF_SEC,
                         attempt,
                     )
                     time.sleep(jittered)

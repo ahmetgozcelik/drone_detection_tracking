@@ -17,6 +17,8 @@ Kullanım (pipeline.py içinde):
 
 from __future__ import annotations
 
+import numpy as np
+
 from configs import settings
 from core.detectors.yolo_onnx import YoloOnnxDetector
 from core.interfaces.idetector import IDetector
@@ -81,12 +83,15 @@ class SystemController:
 
     # ── Ana İşlem ────────────────────────────────────────────────────────────
 
-    def process(self, frame: np.ndarray) -> HybridFrameResult:
+    def process(
+        self, frame: np.ndarray, latency_ms: float = 0.0,
+    ) -> HybridFrameResult:
         """
         Kareyi işle: YOLO bir kez, ``TrackerPool`` tüm hibrit izleyicileri günceller.
 
         Args:
             frame: BGR formatında numpy dizisi. StreamManager'dan kuyruk üzerinden gelir.
+            latency_ms: Bir önceki kareden (EWM) gelen gecikme; Kalman ileri kestirim.
 
         Returns:
             ``HybridFrameResult`` (``targets: List[TargetData]``) — UI ve metrik.
@@ -96,7 +101,9 @@ class SystemController:
         """
         if not self._loaded:
             raise RuntimeError("SystemController.load() önce çağrılmalı.")
-        return self._pool.process(frame, camera_id=0)
+        return self._pool.process(
+            frame, camera_id=0, latency_ms=latency_ms,
+        )
 
     # ── Durum Sorgu ──────────────────────────────────────────────────────────
 

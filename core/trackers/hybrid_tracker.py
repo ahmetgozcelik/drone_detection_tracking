@@ -1,5 +1,9 @@
 """
-hybrid_tracker.py — YOLO + OpenCV hibrit durum makinesi (SOT) ve hedef sarmalama (MOT).
+hybrid_tracker.py — YOLO-güdümlü hibrit asenkron takip + KCF kurtarma (5 kare) ve
+Kalman (8B) pürüzsüzleştirme. MOT: ``TrackerPool`` hedef başına ``HybridTracker``.
+
+Birincil: her kare YOLO eşleşmesi. YOLO yok: KCF ile en fazla N ardışık kare;
+aşılırsa KAYIP.
 """
 
 from __future__ import annotations
@@ -11,8 +15,8 @@ import numpy as np
 from configs import settings
 from configs.constants import STATUS_DETECT, STATUS_LOST, STATUS_TRACK
 from core.interfaces.idetector import Detection, IDetector
-from core.interfaces.itracker import ITracker, TrackResult
-from core.trackers.base_trackers import create_tracker
+from core.interfaces.itracker import TrackResult
+from core.trackers.base_trackers import KcfTracker
 from core.trackers.kalman_predictor import KalmanPredictor
 from utils.logger import get_logger
 
@@ -33,8 +37,8 @@ class HybridFrameResult:
     """
     Kare sonucu: çoklu hedef (MOT) ve alınan kamera.
 
-    ``bbox`` / ``status`` (primary) alanları: SectorManager, metrik, eski SOT
-    yolları ile geriye uyum.
+    ``bbox`` / ``status`` (primary) alanları: SectorManager, metrik, eski yollar
+    ile geriye uyum.
     """
     targets: list[TargetData] = field(default_factory=list)
     camera_id: int = 0
@@ -86,27 +90,30 @@ class HybridFrameResult:
 
 class HybridTracker:
     """
-    Durum makinesi: DETECTING → TRACKING → LOST → DETECTING.
+    YOLO-güdümlü KCF: YOLO eşleşmesi varken Kalman düzeltir + KCF her eşleşmede
+    yeniden yüklenir. Eşleşme yokken (en fazla N kare) KCF ``update`` ile
+    kurtarma; aşımında KAYIP.
 
-    TAKIP modunda hedef başına ``KalmanPredictor`` (merkez + hız): kare başı
-    ``predict`` → OpenCV ``update`` → güven eşiği üstünde ``correct``;
-    dışa yalnızca pürüzsüz Kalman bbox.
-
-    MOT havuzu: ``shared_detections`` + hedefe özel ``assigned``.
+    SOT sınıfı (``CsrtTracker``) bu mimaride birincil kare hızı için
+    çağrılmaz; sadece ``KcfTracker`` yedek yol olarak kullanılır.
     """
 
     def __init__(self, detector: IDetector) -> None:
         self._detector = detector
         tcfg = settings["tracker"]
-        mode = tcfg.get("mode", "csrt")
-        self._tracker: ITracker = create_tracker(mode)
+        s_cfg = settings.get("stream", {})
+        self._target_fps: float = float(s_cfg.get("target_fps", 30.0))
         self._redetect_interval: int = int(tcfg.get("redetect_interval", 60))
-        self._kalman_min_conf: float = float(tcfg.get("kalman_min_tracker_conf", 0.25))
+        self._max_fallback_frames: int = int(
+            tcfg.get("kcf_fallback_max_frames", 5),
+        )
+        self._kcf: KcfTracker = KcfTracker()
         self._state: str = STATUS_DETECT
         self._track_frame_count: int = 0
         self._lost_frame_count: int = 0
         self._pooled: bool = False
         self._kalman: KalmanPredictor | None = None
+        self._fallback_count: int = 0
 
     @property
     def state(self) -> str:
@@ -117,9 +124,16 @@ class HybridTracker:
             return
         old = self._state
         if new_state in (STATUS_LOST, STATUS_DETECT):
-            self._clear_kalman()
+            self._clear_tracking_resources()
         self._state = new_state
         log.info("Durum geçişi: %s → %s", old, new_state)
+
+    def _clear_tracking_resources(self) -> None:
+        if self._kalman is not None:
+            self._kalman.clear()
+        self._kalman = None
+        self._kcf.reset()
+        self._fallback_count = 0
 
     def _clear_kalman(self) -> None:
         if self._kalman is not None:
@@ -134,49 +148,11 @@ class HybridTracker:
         else:
             self._kalman = None
 
-    @staticmethod
-    def _center_of_bbox(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
-        x, y, w, h = bbox
-        return (x + w / 2.0, y + h / 2.0)
-
-    def _kalman_out_or(
-        self,
-        fallback: tuple[int, int, int, int],
-        frame: np.ndarray,
-    ) -> tuple[int, int, int, int]:
-        if self._kalman is not None:
-            try:
-                ob = self._kalman.output_bbox(frame.shape)
-                if ob is not None:
-                    return ob
-            except (TypeError, ValueError) as e:
-                log.debug("Kalman out_or: %s", e)
-        return fallback
-
-    def _kalman_fuse_output(
-        self,
-        frame: np.ndarray,
-        tr: TrackResult,
-    ) -> tuple[tuple[int, int, int, int], float]:
-        """
-        OpenCV yalnızca ölçüm; dışa Kalman pürüzsüz (``predict`` bu çağrıdan önce
-        atıldı, ``correct`` güven eşiği üstünde uygulanır).
-        """
-        if tr.success and self._kalman is not None:
-            try:
-                if tr.confidence >= self._kalman_min_conf:
-                    cx, cy = self._center_of_bbox(tr.bbox)
-                    self._kalman.correct(cx, cy)
-                    _x, _y, w, h = tr.bbox
-                    self._kalman.set_size(int(w), int(h))
-                out = self._kalman.output_bbox(frame.shape)
-                if out is not None:
-                    return (out, float(tr.confidence))
-            except (TypeError, ValueError) as e:
-                log.debug("Kalman/ölçü birleştirme: %s", e)
-        if tr.success:
-            return (tr.bbox, float(tr.confidence))
-        return ((0, 0, 0, 0), 0.0)
+    def _reinit_kcf(
+        self, frame: np.ndarray, bbox: tuple[int, int, int, int],
+    ) -> bool:
+        self._kcf.reset()
+        return self._kcf.init(frame, bbox)
 
     @staticmethod
     def _clip_bbox(
@@ -206,6 +182,37 @@ class HybridTracker:
             return list(shared)
         return self._detector.detect(frame)
 
+    def _yolo_assignment(
+        self,
+        frame: np.ndarray,
+        shared: list[Detection] | None,
+        assigned: Detection | None,
+    ) -> Detection | None:
+        """Bu hedef için YOLO tespit eşleşmesi (MOT: ``assigned``; tekil: en iyi tespit)."""
+        if assigned is not None:
+            return assigned
+        if not self._pooled:
+            dets = self._dets(frame, shared)
+            return self._best_detection(dets) if dets else None
+        return None
+
+    def _output_smooth(
+        self,
+        frame: np.ndarray,
+        fallback_bb: tuple[int, int, int, int],
+        latency_ms: float = 0.0,
+    ) -> tuple[int, int, int, int]:
+        if self._kalman is not None:
+            if latency_ms > 0.0:
+                ob = self._kalman.predict_forward(
+                    latency_ms, frame.shape, self._target_fps,
+                )
+            else:
+                ob = self._kalman.output_bbox(frame.shape)
+            if ob is not None:
+                return ob
+        return fallback_bb
+
     def _fr(
         self,
         target_id: str,
@@ -230,18 +237,19 @@ class HybridTracker:
         shared_detections: list[Detection] | None = None,
         assigned: Detection | None = None,
         camera_id: int = 0,
+        latency_ms: float = 0.0,
     ) -> HybridFrameResult:
         self._pooled = shared_detections is not None
         if self._state == STATUS_DETECT:
             return self._step_detecting(
-                frame, target_id, shared_detections, assigned, camera_id,
+                frame, target_id, shared_detections, assigned, camera_id, latency_ms,
             )
         if self._state == STATUS_TRACK:
             return self._step_tracking(
-                frame, target_id, shared_detections, assigned, camera_id,
+                frame, target_id, shared_detections, assigned, camera_id, latency_ms,
             )
         return self._step_lost(
-            frame, target_id, shared_detections, assigned, camera_id,
+            frame, target_id, shared_detections, assigned, camera_id, latency_ms,
         )
 
     def _step_detecting(
@@ -251,6 +259,7 @@ class HybridTracker:
         shared: list[Detection] | None,
         assigned: Detection | None,
         camera_id: int,
+        latency_ms: float = 0.0,
     ) -> HybridFrameResult:
         dets = self._dets(frame, shared)
         if self._pooled and assigned is None:
@@ -267,15 +276,15 @@ class HybridTracker:
         if bbox is None:
             log.warning("Tespit bbox frame dışında, atlanıyor: %s", det.bbox)
             return self._fr(target_id, (0, 0, 0, 0), STATUS_DETECT, 0.0, camera_id)
-        self._tracker.reset()
-        if not self._tracker.init(frame, bbox):
-            log.warning("Takipçi init başarısız (DETECTING). bbox=%s", bbox)
+        if not self._reinit_kcf(frame, bbox):
+            log.warning("KCF init başarısız (DETECTING). bbox=%s", bbox)
             return self._fr(target_id, (0, 0, 0, 0), STATUS_DETECT, 0.0, camera_id)
         self._transition(STATUS_TRACK)
         self._track_frame_count = 0
         self._lost_frame_count = 0
+        self._fallback_count = 0
         self._init_kalman(bbox)
-        out_b0 = self._kalman_out_or(bbox, frame)
+        out_b0 = self._output_smooth(frame, bbox, latency_ms)
         return self._fr(
             target_id, out_b0, STATUS_TRACK, float(det.confidence), camera_id,
         )
@@ -287,56 +296,46 @@ class HybridTracker:
         shared: list[Detection] | None,
         assigned: Detection | None,
         camera_id: int,
+        latency_ms: float = 0.0,
     ) -> HybridFrameResult:
         self._track_frame_count += 1
         if self._kalman is not None:
             try:
                 self._kalman.predict()
-            except Exception as e:  # noqa: BLE001 — OpenCV/numpy aritmetiği
+            except Exception as e:  # noqa: BLE001
                 log.debug("Kalman predict: %s", e)
-        tr: TrackResult = self._tracker.update(frame)
-        conf = float(tr.confidence) if tr.success else 0.0
-        periodic = (
-            (not self._pooled)
-            and self._redetect_interval > 0
-            and self._track_frame_count % self._redetect_interval == 0
-        )
-        if self._pooled:
-            need_yolo = not tr.success
-        else:
-            need_yolo = (not tr.success) or periodic
-        if not need_yolo:
-            out_bb, out_cf = self._kalman_fuse_output(frame, tr)
-            return self._fr(target_id, out_bb, STATUS_TRACK, out_cf, camera_id)
-        dets = self._dets(frame, shared)
-        if not dets:
-            self._tracker.reset()
-            self._transition(STATUS_LOST)
-            self._lost_frame_count = 0
-            return self._fr(target_id, (0, 0, 0, 0), STATUS_LOST, 0.0, camera_id)
-        if not tr.success:
-            if self._pooled:
-                if assigned is not None:
-                    det = assigned
-                else:
-                    self._transition(STATUS_LOST)
-                    self._lost_frame_count = 0
-                    return self._fr(target_id, (0, 0, 0, 0), STATUS_LOST, 0.0, camera_id)
-            else:
-                det = self._best_detection(dets)
-            self._tracker.reset()
-            if self._tracker.init(frame, det.bbox):
-                self._track_frame_count = 0
-                self._init_kalman(det.bbox)
-                out_b = self._kalman_out_or(det.bbox, frame)
+
+        yolo = self._yolo_assignment(frame, shared, assigned)
+
+        if yolo is not None:
+            bb = self._clip_bbox(yolo.bbox, frame.shape)
+            if bb is not None:
+                if self._kalman is not None:
+                    self._kalman.correct(bb)
+                self._fallback_count = 0
+                if not self._reinit_kcf(frame, bb):
+                    log.debug(
+                        "KCF re-init (YOLO) başarısız, Kalman sürer: bbox=%s", bb,
+                    )
+                out_bb = self._output_smooth(frame, bb, latency_ms)
                 return self._fr(
-                    target_id, out_b, STATUS_TRACK, float(det.confidence), camera_id,
+                    target_id, out_bb, STATUS_TRACK, float(yolo.confidence), camera_id,
                 )
-            self._transition(STATUS_LOST)
-            self._lost_frame_count = 0
-            return self._fr(target_id, (0, 0, 0, 0), STATUS_LOST, 0.0, camera_id)
-        out_bb, out_cf = self._kalman_fuse_output(frame, tr)
-        return self._fr(target_id, out_bb, STATUS_TRACK, out_cf, camera_id)
+            # Geçersiz kırpım → aşağıda KCF kurtarma (YOLO yok gibi)
+        if self._fallback_count < self._max_fallback_frames:
+            tr: TrackResult = self._kcf.update(frame)
+            if tr.success and self._kalman is not None:
+                cbb = self._clip_bbox(tr.bbox, frame.shape)
+                if cbb is not None:
+                    self._kalman.correct(cbb)
+            self._fallback_count += 1
+            out_bb = self._output_smooth(frame, (0, 0, 0, 0), latency_ms)
+            return self._fr(
+                target_id, out_bb, STATUS_TRACK, 1.0, camera_id,
+            )
+        self._transition(STATUS_LOST)
+        self._lost_frame_count = 0
+        return self._fr(target_id, (0, 0, 0, 0), STATUS_LOST, 0.0, camera_id)
 
     def _step_lost(
         self,
@@ -345,6 +344,7 @@ class HybridTracker:
         shared: list[Detection] | None,
         assigned: Detection | None,
         camera_id: int,
+        latency_ms: float = 0.0,
     ) -> HybridFrameResult:
         dets = self._dets(frame, shared)
         reacquire: Detection | None
@@ -354,22 +354,21 @@ class HybridTracker:
             reacquire = self._best_detection(dets) if dets else None
         if reacquire is not None:
             bbox = self._clip_bbox(reacquire.bbox, frame.shape)
-            if bbox is not None:
-                self._tracker.reset()
-                if self._tracker.init(frame, bbox):
-                    self._transition(STATUS_TRACK)
-                    self._track_frame_count = 0
-                    self._lost_frame_count = 0
-                    self._init_kalman(bbox)
-                    out_b = self._kalman_out_or(bbox, frame)
-                    return self._fr(
-                        target_id,
-                        out_b,
-                        STATUS_TRACK,
-                        float(reacquire.confidence),
-                        camera_id,
-                    )
-                log.warning("Takipçi init başarısız (LOST). bbox=%s", bbox)
+            if bbox is not None and self._reinit_kcf(frame, bbox):
+                self._transition(STATUS_TRACK)
+                self._track_frame_count = 0
+                self._lost_frame_count = 0
+                self._fallback_count = 0
+                self._init_kalman(bbox)
+                out_b = self._output_smooth(frame, bbox, latency_ms)
+                return self._fr(
+                    target_id,
+                    out_b,
+                    STATUS_TRACK,
+                    float(reacquire.confidence),
+                    camera_id,
+                )
+            log.warning("KCF init başarısız (LOST). bbox=%s", bbox)
         self._lost_frame_count += 1
         if (
             self._redetect_interval > 0
@@ -381,8 +380,7 @@ class HybridTracker:
         return self._fr(target_id, (0, 0, 0, 0), STATUS_LOST, 0.0, camera_id)
 
     def reset(self) -> None:
-        self._tracker.reset()
-        self._clear_kalman()
+        self._clear_tracking_resources()
         self._state = STATUS_DETECT
         self._track_frame_count = 0
         self._lost_frame_count = 0
