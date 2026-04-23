@@ -1,9 +1,8 @@
 """
-main_viewmodel.py — Ana pencere için sunum durumu (MVVM ViewModel).
+main_viewmodel.py — MVVM ViewModel: Pipeline yaşam döngüsü + görüntü durumu.
 
-Pipeline çıktısı (frame, HybridFrameResult, MetricsSnapshot) alınır, View'a
-gönderilecek metin değerleri, rozet stilleri ve çizim parametreleri üretilir.
-View yalnızca bu tiplere göre bound widget ve overlay günceller.
+View sadece çizer; ``start_pipeline`` / ``stop_pipeline`` burada.
+Çıktı: ``state_ready(ViewDisplayState, frame)``.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt5.QtWidgets import QMessageBox, QWidget
 
 from configs.constants import (
     STATUS_DETECT,
@@ -19,8 +19,14 @@ from configs.constants import (
     STATUS_LOST,
     STATUS_TRACK,
 )
+from core.engine.pipeline import Pipeline
+from core.engine.sector_manager import SectorManager
+from core.interfaces import IStream
 from core.trackers.hybrid_tracker import HybridFrameResult
+from utils.logger import get_logger
 from utils.metrics import MetricsSnapshot
+
+log = get_logger(__name__)
 
 # Askeri HMI: .cursor/rules/ui.mdc (Renk Kodlama Standardı)
 CLR_BADGE: dict[str, tuple[str, str]] = {
@@ -71,15 +77,19 @@ class ViewDisplayState:
 
 class MainViewModel(QObject):
     """
-    Tespit/takip sonuçlarından ViewDisplayState üretir.
-    Son bilinen bbox (kayıp modunda gri kutu) durumu burada tutulur.
+    Tespit/takip sonuçlarından ViewDisplayState üretir; Pipeline'ı yönetir.
+    ``HybridTracker`` yok: motor ``SystemController`` / ``TrackerPool`` (controller katmanı).
     """
 
     state_ready = pyqtSignal(object, object)  # ViewDisplayState, frame (ndarray)
+    # Inference thread → biçimlendirme (QueuedConnection, ana thread)
+    pipe_result = pyqtSignal(object, object, object)  # frame, HybridFrameResult, MetricsSnapshot
 
     def __init__(self) -> None:
         super().__init__()
         self._last_known_bbox: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._pipeline: Pipeline | None = None
+        self.pipe_result.connect(self.on_pipeline_result)
 
     @staticmethod
     def _parse_fps_display(snap: MetricsSnapshot) -> str:
@@ -113,6 +123,52 @@ class MainViewModel(QObject):
         s = _as_metrics(snap)
         st = self._build_view_state(f, r, s)
         self.state_ready.emit(st, f)
+
+    def start_pipeline(
+        self,
+        stream: IStream,
+        sector_manager: SectorManager | None,
+        parent: QWidget,
+    ) -> bool:
+        """View'dan istenen akış: öncekini durdur, ``Pipeline`` oluştur ve başlat. Başarı: True."""
+        self.stop_pipeline()
+        if sector_manager is not None:
+            sm = sector_manager
+
+            def _on_result(
+                frame: object, result: object, snap: object,
+            ) -> None:
+                sm.handle_frame_result(frame, result, snap)  # type: ignore[arg-type]
+                self.pipe_result.emit(frame, result, snap)
+
+            on_result = _on_result
+        else:
+            on_result = self.pipe_result.emit
+
+        self._pipeline = Pipeline(stream=stream, on_result=on_result)
+        try:
+            self._pipeline.start()
+        except Exception as exc:  # noqa: BLE001 — kullanıcıya rapor
+            log.exception("Pipeline baslatılamadı: %s", exc)
+            QMessageBox.critical(
+                parent, "Hata", f"Pipeline baslatılamadı:\n{exc}",
+            )
+            self._pipeline = None
+            return False
+        log.info("Pipeline baslatıldı (ViewModel).")
+        return True
+
+    def stop_pipeline(self) -> None:
+        if self._pipeline is not None:
+            try:
+                self._pipeline.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Pipeline durdurulurken hata: %s", exc)
+            self._pipeline = None
+
+    @property
+    def is_pipeline_active(self) -> bool:
+        return self._pipeline is not None
 
     def _build_view_state(
         self,

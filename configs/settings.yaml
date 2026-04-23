@@ -23,6 +23,8 @@ tracker:
   mot_match_centroid_max_px: 180.0         # IoU yoksa merkez mesafesi yedeği
   mot_lost_remove_frames: 45                # Uzun süre kayıp → izleyiciyi kaldır
   mot_max_tracks: 8                        # Aynı anda en fazla hedef
+  # Kalman hareket kestirimi (hibrit; OpenCV ölçüm birleşimi)
+  kalman_min_tracker_conf: 0.25            # OpenCV/CSRT ölçümünü Kalman ile düzeltmek için min. güven
 
 # --- Video Kaynakları ---
 stream:

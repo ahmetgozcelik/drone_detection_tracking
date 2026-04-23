@@ -129,6 +129,9 @@ class StreamManager:
         """
         Akışı açmayı settings'teki parametrelerle yeniden dene.
 
+        Exponential backoff (``reconnect_delay`` × 2^n, tavan 30 s) ve
+        %10–%20 jitter (``random.uniform``) ile bekleme.
+
         Returns:
             True: Bağlantı başarılı.
             False: Tüm denemeler başarısız.

@@ -31,6 +31,8 @@ class SystemController:
     """
     Dedektör ve hibrit ``TrackerPool`` sarmalaması; pipeline tek giriş noktası.
 
+    Doğrudan ``HybridTracker`` referansı yok: çoklu hedef takibi ``TrackerPool`` ile.
+
     Args:
         detector: IDetector implementasyonu.
         pool:     İsteğe bağlı dış enjekte ``TrackerPool``; verilmezse aynı dedektörle oluşur.

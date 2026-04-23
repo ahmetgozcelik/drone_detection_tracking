@@ -116,7 +116,12 @@ class Pipeline:
                 if self._inference_thread.is_alive():
                     log.warning("Inference thread zaman aşımında sonlandı.")
         finally:
-            # Tüm asılı kareleri serbest bırak (eşdeğer: kuyruk dökümü; deadlock önleme)
+            try:
+                with self._queue.mutex:
+                    self._queue.queue.clear()  # type: ignore[attr-defined]
+            except Exception as e:
+                log.debug("Kuyruk içi clear atlandı: %s", e)
+            # Tüm asılı kareleri serbest bırak (deadlock / bellek)
             _drain_frame_queue("graceful: finally")
             if self._controller is not None:
                 try:

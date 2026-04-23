@@ -13,6 +13,7 @@ from configs.constants import STATUS_DETECT, STATUS_LOST, STATUS_TRACK
 from core.interfaces.idetector import Detection, IDetector
 from core.interfaces.itracker import ITracker, TrackResult
 from core.trackers.base_trackers import create_tracker
+from core.trackers.kalman_predictor import KalmanPredictor
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -85,23 +86,27 @@ class HybridFrameResult:
 
 class HybridTracker:
     """
-    Durum makinesi: DETECTING → TRACKING → LOST → DETECTING
+    Durum makinesi: DETECTING → TRACKING → LOST → DETECTING.
 
-    SOT: ``process(frame)`` (kwargs olmadan, yerel YOLO).
+    TAKIP modunda hedef başına ``KalmanPredictor`` (merkez + hız): kare başı
+    ``predict`` → OpenCV ``update`` → güven eşiği üstünde ``correct``;
+    dışa yalnızca pürüzsüz Kalman bbox.
 
-    MOT havuzu: ``shared_detections`` + hedefe özel ``assigned`` (başka hedefe
-    ait tespit tüketilmez).
+    MOT havuzu: ``shared_detections`` + hedefe özel ``assigned``.
     """
 
     def __init__(self, detector: IDetector) -> None:
         self._detector = detector
-        mode = settings["tracker"]["mode"]
+        tcfg = settings["tracker"]
+        mode = tcfg.get("mode", "csrt")
         self._tracker: ITracker = create_tracker(mode)
-        self._redetect_interval: int = int(settings["tracker"]["redetect_interval"])
+        self._redetect_interval: int = int(tcfg.get("redetect_interval", 60))
+        self._kalman_min_conf: float = float(tcfg.get("kalman_min_tracker_conf", 0.25))
         self._state: str = STATUS_DETECT
         self._track_frame_count: int = 0
         self._lost_frame_count: int = 0
         self._pooled: bool = False
+        self._kalman: KalmanPredictor | None = None
 
     @property
     def state(self) -> str:
@@ -111,8 +116,67 @@ class HybridTracker:
         if new_state == self._state:
             return
         old = self._state
+        if new_state in (STATUS_LOST, STATUS_DETECT):
+            self._clear_kalman()
         self._state = new_state
         log.info("Durum geçişi: %s → %s", old, new_state)
+
+    def _clear_kalman(self) -> None:
+        if self._kalman is not None:
+            self._kalman.clear()
+        self._kalman = None
+
+    def _init_kalman(self, bbox: tuple[int, int, int, int]) -> None:
+        self._clear_kalman()
+        k = KalmanPredictor()
+        if k.init_from_bbox(bbox):
+            self._kalman = k
+        else:
+            self._kalman = None
+
+    @staticmethod
+    def _center_of_bbox(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
+        x, y, w, h = bbox
+        return (x + w / 2.0, y + h / 2.0)
+
+    def _kalman_out_or(
+        self,
+        fallback: tuple[int, int, int, int],
+        frame: np.ndarray,
+    ) -> tuple[int, int, int, int]:
+        if self._kalman is not None:
+            try:
+                ob = self._kalman.output_bbox(frame.shape)
+                if ob is not None:
+                    return ob
+            except (TypeError, ValueError) as e:
+                log.debug("Kalman out_or: %s", e)
+        return fallback
+
+    def _kalman_fuse_output(
+        self,
+        frame: np.ndarray,
+        tr: TrackResult,
+    ) -> tuple[tuple[int, int, int, int], float]:
+        """
+        OpenCV yalnızca ölçüm; dışa Kalman pürüzsüz (``predict`` bu çağrıdan önce
+        atıldı, ``correct`` güven eşiği üstünde uygulanır).
+        """
+        if tr.success and self._kalman is not None:
+            try:
+                if tr.confidence >= self._kalman_min_conf:
+                    cx, cy = self._center_of_bbox(tr.bbox)
+                    self._kalman.correct(cx, cy)
+                    _x, _y, w, h = tr.bbox
+                    self._kalman.set_size(int(w), int(h))
+                out = self._kalman.output_bbox(frame.shape)
+                if out is not None:
+                    return (out, float(tr.confidence))
+            except (TypeError, ValueError) as e:
+                log.debug("Kalman/ölçü birleştirme: %s", e)
+        if tr.success:
+            return (tr.bbox, float(tr.confidence))
+        return ((0, 0, 0, 0), 0.0)
 
     @staticmethod
     def _clip_bbox(
@@ -210,7 +274,11 @@ class HybridTracker:
         self._transition(STATUS_TRACK)
         self._track_frame_count = 0
         self._lost_frame_count = 0
-        return self._fr(target_id, bbox, STATUS_TRACK, float(det.confidence), camera_id)
+        self._init_kalman(bbox)
+        out_b0 = self._kalman_out_or(bbox, frame)
+        return self._fr(
+            target_id, out_b0, STATUS_TRACK, float(det.confidence), camera_id,
+        )
 
     def _step_tracking(
         self,
@@ -221,6 +289,11 @@ class HybridTracker:
         camera_id: int,
     ) -> HybridFrameResult:
         self._track_frame_count += 1
+        if self._kalman is not None:
+            try:
+                self._kalman.predict()
+            except Exception as e:  # noqa: BLE001 — OpenCV/numpy aritmetiği
+                log.debug("Kalman predict: %s", e)
         tr: TrackResult = self._tracker.update(frame)
         conf = float(tr.confidence) if tr.success else 0.0
         periodic = (
@@ -233,7 +306,8 @@ class HybridTracker:
         else:
             need_yolo = (not tr.success) or periodic
         if not need_yolo:
-            return self._fr(target_id, tr.bbox, STATUS_TRACK, conf, camera_id)
+            out_bb, out_cf = self._kalman_fuse_output(frame, tr)
+            return self._fr(target_id, out_bb, STATUS_TRACK, out_cf, camera_id)
         dets = self._dets(frame, shared)
         if not dets:
             self._tracker.reset()
@@ -253,13 +327,16 @@ class HybridTracker:
             self._tracker.reset()
             if self._tracker.init(frame, det.bbox):
                 self._track_frame_count = 0
+                self._init_kalman(det.bbox)
+                out_b = self._kalman_out_or(det.bbox, frame)
                 return self._fr(
-                    target_id, det.bbox, STATUS_TRACK, float(det.confidence), camera_id,
+                    target_id, out_b, STATUS_TRACK, float(det.confidence), camera_id,
                 )
             self._transition(STATUS_LOST)
             self._lost_frame_count = 0
             return self._fr(target_id, (0, 0, 0, 0), STATUS_LOST, 0.0, camera_id)
-        return self._fr(target_id, tr.bbox, STATUS_TRACK, conf, camera_id)
+        out_bb, out_cf = self._kalman_fuse_output(frame, tr)
+        return self._fr(target_id, out_bb, STATUS_TRACK, out_cf, camera_id)
 
     def _step_lost(
         self,
@@ -283,9 +360,11 @@ class HybridTracker:
                     self._transition(STATUS_TRACK)
                     self._track_frame_count = 0
                     self._lost_frame_count = 0
+                    self._init_kalman(bbox)
+                    out_b = self._kalman_out_or(bbox, frame)
                     return self._fr(
                         target_id,
-                        bbox,
+                        out_b,
                         STATUS_TRACK,
                         float(reacquire.confidence),
                         camera_id,
@@ -303,6 +382,7 @@ class HybridTracker:
 
     def reset(self) -> None:
         self._tracker.reset()
+        self._clear_kalman()
         self._state = STATUS_DETECT
         self._track_frame_count = 0
         self._lost_frame_count = 0

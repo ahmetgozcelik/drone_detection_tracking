@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import (
     QCloseEvent,
     QColor,
@@ -44,7 +44,6 @@ from configs.constants import (
     COLOR_YELLOW,
     STATUS_IDLE,
 )
-from core.engine.pipeline import Pipeline
 from core.engine.sector_manager import SectorManager
 from core.interfaces import IStream
 from ui.viewmodels.main_viewmodel import (
@@ -144,9 +143,7 @@ class MetricRow(QWidget):
 #                              Main Window
 # ════════════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
-    """Drone Takip Sistemi ana penceresi (MVVM — View)."""
-
-    _sig_result = pyqtSignal(object, object, object)
+    """Drone Takip Sistemi ana penceresi (MVVM — View: Pipeline ViewModel’de)."""
 
     def __init__(self, sector_manager: SectorManager | None = None) -> None:
         super().__init__()
@@ -154,7 +151,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(ui_cfg.get("window_title", "Drone Takip Sistemi"))
         self.setMinimumSize(1100, 640)
 
-        self._pipeline: Pipeline | None = None
         self._view_model = MainViewModel()
         self._sector_manager: SectorManager | None = sector_manager
 
@@ -164,7 +160,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_global_style()
-        self._sig_result.connect(self._view_model.on_pipeline_result)
         self._view_model.state_ready.connect(self._on_view_state)
         self._set_badge_idle()
         self._set_connection(False, "BAGLANTI YOK")
@@ -201,7 +196,7 @@ class MainWindow(QMainWindow):
                 color: {CLR_BG};
             }}
             QPushButton:pressed {{
-                background-color: #0099c8;
+                background-color: #006b88;
                 color: {CLR_BG};
             }}
             QPushButton:disabled {{
@@ -483,44 +478,18 @@ class MainWindow(QMainWindow):
         self._row_tilt.set_value(f"{tilt_deg:.1f}")
         self._row_sw_mode.set_value(mode)
 
-    # ── Pipeline yaşam döngüsü ──────────────────────────────────────────────
     def _start_pipeline(self, stream: IStream) -> None:
-        self._stop_pipeline()
-
-        # SectorManager varsa on_result callback zinciri oluştur
-        if self._sector_manager is not None:
-            sm = self._sector_manager
-
-            def _chained_on_result(
-                frame: object, result: object, snap: object,
-            ) -> None:
-                sm.handle_frame_result(frame, result, snap)  # type: ignore[arg-type]
-                self._sig_result.emit(frame, result, snap)
-
-            on_result = _chained_on_result
+        ok = self._view_model.start_pipeline(
+            stream, self._sector_manager, self,
+        )
+        if ok:
+            self._set_connection(True, "AKTIF")
         else:
-            on_result = self._sig_result.emit
-
-        self._pipeline = Pipeline(stream=stream, on_result=on_result)
-        try:
-            self._pipeline.start()
-        except Exception as exc:
-            log.exception("Pipeline baslatılamadı: %s", exc)
-            QMessageBox.critical(self, "Hata", f"Pipeline baslatılamadı:\n{exc}")
-            self._pipeline = None
             self._set_connection(False, "BAGLANTI BASARISIZ")
-            return
-        self._set_connection(True, "AKTIF")
-        log.info("Pipeline baslatıldı.")
 
     def _stop_pipeline(self) -> None:
-        if self._pipeline is not None:
-            try:
-                self._pipeline.stop()
-            except Exception as exc:
-                log.exception("Pipeline durdurulurken hata: %s", exc)
-            self._pipeline = None
-            self._set_connection(False, "BAGLANTI YOK")
+        self._view_model.stop_pipeline()
+        self._set_connection(False, "BAGLANTI YOK")
 
     # ── Kullanıcı aksiyonları ───────────────────────────────────────────────
     def _on_open_file(self) -> None:
