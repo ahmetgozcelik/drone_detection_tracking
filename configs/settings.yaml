@@ -13,11 +13,16 @@ model:
   conf_threshold: 0.45                     # Tespit güven eşiği (plan.txt: >0.6)
   iou_threshold: 0.45                      # NMS için IoU eşiği
 
-# --- Hibrit Takip ---
+# --- Hibrit Takip (MOT havuzu) ---
 tracker:
   mode: "csrt"                             # "csrt" (hassas) | "kcf" (hızlı)
   fallback_confidence: 0.30               # Bu değerin altında YOLO'ya geri dön
   redetect_interval: 60                   # Her N karede bir arka planda YOLO çalıştır
+  # TrackerPool (çoklu hedef) — açık sürüm, OpenCV + IoU/merkez
+  mot_match_iou: 0.12                      # Tespit–izleyici eşleşmesi minimum IoU
+  mot_match_centroid_max_px: 180.0         # IoU yoksa merkez mesafesi yedeği
+  mot_lost_remove_frames: 45                # Uzun süre kayıp → izleyiciyi kaldır
+  mot_max_tracks: 8                        # Aynı anda en fazla hedef
 
 # --- Video Kaynakları ---
 stream:

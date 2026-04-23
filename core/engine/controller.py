@@ -2,7 +2,7 @@
 controller.py — Strategy Pattern ile dedektör ve hibrit takipçi yönetimi.
 
 CURSOR İÇİN BAĞLAM:
-    Bu sınıf tüm core bileşenlerini (IDetector, HybridTracker) bir arada tutar.
+    Bu sınıf tüm core bileşenlerini (IDetector, TrackerPool) bir arada tutar.
     pipeline.py bu sınıfı oluşturur ve process() metodunu çağırır.
     UI katmanı controller'ı doğrudan kullanmaz; pipeline üzerinden iletişim kurar.
     Farklı bir detector (yolo_v8.py) denemek için sadece bu sınıfa yeni bir
@@ -18,28 +18,27 @@ Kullanım (pipeline.py içinde):
 from __future__ import annotations
 
 from configs import settings
-from configs.constants import TRACKER_CSRT, TRACKER_KCF
 from core.detectors.yolo_onnx import YoloOnnxDetector
 from core.interfaces.idetector import IDetector
-from core.trackers.hybrid_tracker import HybridFrameResult, HybridTracker
+from core.trackers.hybrid_tracker import HybridFrameResult
+from core.trackers.tracker_pool import TrackerPool
 from utils.logger import get_logger
-
-import numpy as np
 
 log = get_logger(__name__)
 
 
 class SystemController:
     """
-    Detector ve HybridTracker'ı sarar; pipeline için tek işlem noktası sağlar.
+    Dedektör ve hibrit ``TrackerPool`` sarmalaması; pipeline tek giriş noktası.
 
     Args:
-        detector: IDetector implementasyonu (varsayılan: YoloOnnxDetector).
+        detector: IDetector implementasyonu.
+        pool:     İsteğe bağlı dış enjekte ``TrackerPool``; verilmezse aynı dedektörle oluşur.
     """
 
-    def __init__(self, detector: IDetector) -> None:
+    def __init__(self, detector: IDetector, pool: TrackerPool | None = None) -> None:
         self._detector = detector
-        self._hybrid   = HybridTracker(detector)
+        self._pool: TrackerPool = pool if pool is not None else TrackerPool(detector)
         self._loaded   = False
 
     # ── Fabrika ──────────────────────────────────────────────────────────────
@@ -73,8 +72,8 @@ class SystemController:
 
     def release(self) -> None:
         """Kaynakları serbest bırak. Pipeline finally bloğunda çağırır."""
+        self._pool.release()
         self._detector.release()
-        self._hybrid.reset()
         self._loaded = False
         log.info("SystemController serbest bırakıldı.")
 
@@ -82,27 +81,27 @@ class SystemController:
 
     def process(self, frame: np.ndarray) -> HybridFrameResult:
         """
-        Tek kareyi işle: YOLO veya tracker — HybridTracker karar verir.
+        Kareyi işle: YOLO bir kez, ``TrackerPool`` tüm hibrit izleyicileri günceller.
 
         Args:
             frame: BGR formatında numpy dizisi. StreamManager'dan kuyruk üzerinden gelir.
 
         Returns:
-            HybridFrameResult(bbox, status) — pipeline bunu metrics ve UI'ya iletir.
+            ``HybridFrameResult`` (``targets: List[TargetData]``) — UI ve metrik.
 
         Raises:
             RuntimeError: load() çağrılmadan process() çağrılırsa.
         """
         if not self._loaded:
             raise RuntimeError("SystemController.load() önce çağrılmalı.")
-        return self._hybrid.process(frame)
+        return self._pool.process(frame, camera_id=0)
 
     # ── Durum Sorgu ──────────────────────────────────────────────────────────
 
     @property
     def current_state(self) -> str:
-        """HybridTracker'ın mevcut durumu (STATUS_DETECT / TRACK / LOST)."""
-        return self._hybrid.state
+        """Havuz özet durumu (çoklu izleyici)."""
+        return self._pool.state_summary
 
     @property
     def is_loaded(self) -> bool:

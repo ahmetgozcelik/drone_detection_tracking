@@ -92,16 +92,32 @@ class Pipeline:
         log.info("Pipeline başlatıldı (Capture + Inference).")
 
     def stop(self) -> None:
+        def _drain_frame_queue(phase: str) -> int:
+            n = 0
+            while True:
+                try:
+                    self._queue.get_nowait()
+                    n += 1
+                except Empty:
+                    break
+            if n:
+                log.debug("Kare kuyruğu boşaltıldı (%s): %d öğe", phase, n)
+            return n
+
         try:
             self._inference_stop.set()
+            # Önce üreticiyi durdur; kuyruğa yeni kare girmesin
+            if self._stream_manager is not None:
+                self._stream_manager.stop()
+                self._stream_manager = None
+            _drain_frame_queue("üretici durdu")
             if self._inference_thread is not None and self._inference_thread.is_alive():
                 self._inference_thread.join(timeout=10.0)
                 if self._inference_thread.is_alive():
                     log.warning("Inference thread zaman aşımında sonlandı.")
-            if self._stream_manager is not None:
-                self._stream_manager.stop()
-                self._stream_manager = None
         finally:
+            # Tüm asılı kareleri serbest bırak (eşdeğer: kuyruk dökümü; deadlock önleme)
+            _drain_frame_queue("graceful: finally")
             if self._controller is not None:
                 try:
                     self._controller.release()
@@ -110,6 +126,7 @@ class Pipeline:
                 self._controller = None
             self._inference_thread = None
             self._started = False
+            gc.collect()
             log.info("Pipeline durduruldu.")
 
     def _inference_loop(self) -> None:

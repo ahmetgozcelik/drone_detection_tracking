@@ -15,6 +15,7 @@ Kullanım (pipeline.py Capture Thread içinde):
     manager.stop()      # Güvenli kapatma
 """
 
+import random
 import threading
 import time
 from queue import Full, Queue
@@ -25,6 +26,12 @@ from core.interfaces import IStream
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Exponential backoff üst sınırı; jitter sürü etkisini (thundering herd) azaltır
+_MAX_BACKOFF_SEC = 30.0
+# Bekleme süresine 10–%20 rastgele çarpan (0.80–1.0 → en fazla %20 salınım)
+_JITTER_MIN = 0.80
+_JITTER_MAX = 1.0
 
 
 class StreamManager:
@@ -136,6 +143,17 @@ class StreamManager:
                 return True
 
             if attempt < self._reconnect_attempts:
-                time.sleep(self._reconnect_delay)
+                # Exponential backoff: reconnect_delay, 2x, 4x, ... (üst sınır 30 s)
+                exp_delay = self._reconnect_delay * (2.0 ** (attempt - 1))
+                capped = min(_MAX_BACKOFF_SEC, exp_delay)
+                jittered = capped * random.uniform(_JITTER_MIN, _JITTER_MAX)
+                if jittered > 0:
+                    log.info(
+                        "Bekleme: %.2f s (üst: %.1f, deneme %d sonrası)",
+                        jittered,
+                        capped,
+                        attempt,
+                    )
+                    time.sleep(jittered)
 
         return False

@@ -49,9 +49,13 @@ def _make_manager(serial_ctrl=None):
 
 
 def _make_result(bbox=(0, 0, 0, 0), status="TESPIT", camera_id=0):
-    """Test için HybridFrameResult örneği."""
+    """Test için HybridFrameResult örneği (MOT geriye dönük from_single)."""
     from core.trackers.hybrid_tracker import HybridFrameResult
-    return HybridFrameResult(bbox=bbox, status=status, camera_id=camera_id)
+    return HybridFrameResult.from_single(
+        bbox=bbox,
+        status=status,
+        camera_id=camera_id,
+    )
 
 
 def _make_snap():
@@ -59,9 +63,7 @@ def _make_snap():
     from utils.metrics import MetricsSnapshot
     return MetricsSnapshot(
         fps=30.0,
-        fps_label="FPS: 30.0",
         latency_ms=10.0,
-        latency_label="Latency: 10.0 ms",
         ram_used_mb=500.0,
         mode="DETECT",
     )

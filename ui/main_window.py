@@ -1,8 +1,9 @@
 """
-main_window.py — MVVM View katmanı; iş mantığı içermez.
+main_window.py — MVVM View katmanı; biçimlendirme ve durum geçişleri viewmodels/ içindedir.
 
-Tüm state, Pipeline.on_result callback'inden gelen (frame, HybridFrameResult, MetricsSnapshot)
-parametrelerinden türetilir. Cross-thread UI güncellemesi yalnızca pyqtSignal ile yapılır.
+Pipeline sonuçları pyqtSignal ile aktarılır; MainViewModel state_ready sinyaliyle
+görünür alanlara dönüştürülmüş ViewDisplayState üretir.
+Cross-thread: yalnızca sinyal zinciri; widget güncellemeleri UI thread'te.
 
 Görsel katman: askeri standart karanlık HMI teması.
 """
@@ -41,17 +42,19 @@ from configs.constants import (
     COLOR_GREEN,
     COLOR_WHITE,
     COLOR_YELLOW,
-    STATUS_DETECT,
     STATUS_IDLE,
-    STATUS_LOST,
-    STATUS_TRACK,
 )
 from core.engine.pipeline import Pipeline
 from core.engine.sector_manager import SectorManager
 from core.interfaces import IStream
-from core.trackers.hybrid_tracker import HybridFrameResult
+from ui.viewmodels.main_viewmodel import (
+    CLR_BADGE,
+    MainViewModel,
+    OverlayDrawSpec,
+    ViewDisplayState,
+    ViewTrackLayer,
+)
 from utils.logger import get_logger
-from utils.metrics import MetricsSnapshot
 
 log = get_logger(__name__)
 
@@ -61,26 +64,19 @@ CLR_PANEL       = "#111827"
 CLR_BOTTOM      = "#0d1526"
 CLR_BORDER      = "#1e3a5f"
 CLR_ACCENT      = "#00d4ff"
-CLR_SUCCESS     = "#00ff88"
-CLR_WARNING     = "#ffaa00"
-CLR_DANGER      = "#ff3355"
+# Askeri anlam paleti: .cursor/rules/ui.mdc
+CLR_SUCCESS     = "#00aa00"
+CLR_WARNING     = "#aaaa00"
+CLR_DANGER      = "#aa0000"
 CLR_TEXT        = "#e2e8f0"
 CLR_TEXT_MUTED  = "#64748b"
 
 FONT_MONO = "Consolas, 'Courier New', monospace"
 
-# Status → (arka plan, yazı rengi)
-_BADGE_COLORS: dict[str, tuple[str, str]] = {
-    STATUS_TRACK:  (CLR_SUCCESS, CLR_BG),
-    STATUS_DETECT: (CLR_WARNING, CLR_BG),
-    STATUS_LOST:   (CLR_DANGER,  "#ffffff"),
-    STATUS_IDLE:   (CLR_BORDER,  CLR_TEXT_MUTED),
-}
-
-_BBOX_COLOR: dict[str, tuple[int, int, int]] = {
-    STATUS_TRACK:  COLOR_GREEN,
-    STATUS_DETECT: COLOR_YELLOW,
-    STATUS_LOST:   (0, 0, 100),
+_BBOX_KEY_BGR: dict[str, tuple[int, int, int]] = {
+    "track":  COLOR_GREEN,
+    "detect": COLOR_YELLOW,
+    "lost_hint": (0, 0, 100),
 }
 
 _BBOX_THICKNESS: int = int(settings.get("ui", {}).get("bbox_thickness", 2))
@@ -159,7 +155,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 640)
 
         self._pipeline: Pipeline | None = None
-        self._last_known_bbox: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._view_model = MainViewModel()
         self._sector_manager: SectorManager | None = sector_manager
 
         # SectorManager'dan pan/tilt güncellemelerini UI'ya aktar
@@ -168,8 +164,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_global_style()
-        self._sig_result.connect(self._on_result_received)
-        self._set_status_badge(STATUS_IDLE)
+        self._sig_result.connect(self._view_model.on_pipeline_result)
+        self._view_model.state_ready.connect(self._on_view_state)
+        self._set_badge_idle()
         self._set_connection(False, "BAGLANTI YOK")
 
     # ── Stil ────────────────────────────────────────────────────────────────
@@ -446,9 +443,16 @@ class MainWindow(QMainWindow):
         return line
 
     # ── Durum güncelleyiciler ───────────────────────────────────────────────
-    def _set_status_badge(self, status: str) -> None:
-        bg, fg = _BADGE_COLORS.get(status, _BADGE_COLORS[STATUS_IDLE])
-        self._badge.setText(status)
+    def _set_badge_idle(self) -> None:
+        bg, fg = CLR_BADGE[STATUS_IDLE]
+        self._badge.setText(STATUS_IDLE)
+        self._apply_badge_style(bg, fg)
+
+    def _apply_badge(self, s: ViewDisplayState) -> None:
+        self._badge.setText(s.status)
+        self._apply_badge_style(s.badge_bg, s.badge_fg)
+
+    def _apply_badge_style(self, bg: str, fg: str) -> None:
         self._badge.setStyleSheet(
             f"background-color: {bg};"
             f"color: {fg};"
@@ -575,77 +579,61 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "Hata", f"Bilinmeyen kaynak tipi: {source}")
 
-    # ── Callback → UI ───────────────────────────────────────────────────────
-    def _on_result_received(
-        self, frame: np.ndarray, result: HybridFrameResult, snap: MetricsSnapshot,
-    ) -> None:
-        # Aktif kamera kimliğini güncelle (camera_id HybridFrameResult'ta)
-        cam_id = getattr(result, "camera_id", 0)
-        self._row_cam.set_value(str(cam_id))
-        self._update_display(frame, result, snap)
+    # ── ViewModel sinyali → UI (ana thread) ─────────────────────────────────
+    def _on_view_state(self, state: object, frame: object) -> None:
+        if not isinstance(state, ViewDisplayState):
+            return
+        if not isinstance(frame, np.ndarray):
+            return
+        self._row_cam.set_value(str(state.active_camera_id))
+        self._apply_badge(state)
+        self._row_fps.set_value(state.fps_value)
+        self._row_latency.set_value(state.latency_value)
+        self._row_ram.set_value(state.ram_value)
+        self._row_coord.set_value(state.coord_value)
+        self._lbl_bbox.setText(state.bbox_caption)
+        self._lbl_last_coord.setText(state.last_coord_caption)
+        self._set_pixmap(self._draw_view_bgr(frame, state))
 
-    def _update_display(
-        self, frame: np.ndarray, result: HybridFrameResult, snap: MetricsSnapshot,
-    ) -> None:
-        status = result.status
-        bbox   = result.bbox
-        has_valid_bbox = bbox != (0, 0, 0, 0)
+    @staticmethod
+    def _draw_view_bgr(frame: np.ndarray, state: ViewDisplayState) -> np.ndarray:
+        if state.track_layers:
+            vis = frame.copy()
+            for L in state.track_layers:
+                if not isinstance(L, ViewTrackLayer):
+                    continue
+                color = _BBOX_KEY_BGR.get(L.color_key, COLOR_GREEN)
+                x, y, w, h = L.bbox
+                cv2.rectangle(vis, (x, y), (x + w, y + h), color, _BBOX_THICKNESS)
+                cv2.putText(
+                    vis,
+                    L.label,
+                    (x, max(y - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1, cv2.LINE_AA,
+                )
+            return vis
+        return MainWindow._draw_overlay_bgr(frame, state.overlay)
 
-        if has_valid_bbox:
-            self._last_known_bbox = bbox
-
-        self._set_status_badge(status)
-
-        fps_val = snap.fps_label.split(":")[-1].strip() if ":" in snap.fps_label else snap.fps_label
-        lat_val = (
-            snap.latency_label.split(":")[-1].replace("ms", "").strip()
-            if ":" in snap.latency_label else snap.latency_label
-        )
-        self._row_fps.set_value(fps_val)
-        self._row_latency.set_value(lat_val)
-        self._row_ram.set_value(f"{snap.ram_used_mb:.0f}")
-
-        if has_valid_bbox:
-            cx = bbox[0] + bbox[2] // 2
-            cy = bbox[1] + bbox[3] // 2
-            self._row_coord.set_value(f"{cx},{cy}")
-            self._lbl_bbox.setText(
-                f"bbox: x={bbox[0]} y={bbox[1]}\n"
-                f"      w={bbox[2]} h={bbox[3]}"
-            )
-            self._lbl_last_coord.setText(f"son_xy: ({cx}, {cy})")
-        elif status == STATUS_LOST and self._last_known_bbox != (0, 0, 0, 0):
-            lx = self._last_known_bbox[0] + self._last_known_bbox[2] // 2
-            ly = self._last_known_bbox[1] + self._last_known_bbox[3] // 2
-            self._row_coord.set_value("---")
-            self._lbl_last_coord.setText(f"son_xy: ({lx}, {ly})")
-        else:
-            self._row_coord.set_value("---")
-
-        rendered = self._draw_overlay(frame, result)
-        self._set_pixmap(rendered)
-
-    # ── Video overlay ───────────────────────────────────────────────────────
-    def _draw_overlay(self, frame: np.ndarray, result: HybridFrameResult) -> np.ndarray:
-        vis    = frame.copy()
-        status = result.status
-        bbox   = result.bbox
-        has_valid_bbox = bbox != (0, 0, 0, 0)
-
-        if has_valid_bbox:
-            color = _BBOX_COLOR.get(status, COLOR_GREEN)
-            x, y, w, h = bbox
+    # ── Video overlay (MOT yok: tek hedef) ─────
+    @staticmethod
+    def _draw_overlay_bgr(frame: np.ndarray, spec: OverlayDrawSpec) -> np.ndarray:
+        vis = frame.copy()
+        if spec.show_primary_bbox:
+            color = _BBOX_KEY_BGR.get(spec.primary_color_key, COLOR_GREEN)
+            x, y, w, h = spec.bbox
             cv2.rectangle(vis, (x, y), (x + w, y + h), color, _BBOX_THICKNESS)
             cv2.putText(
-                vis, f"{status}",
+                vis,
+                spec.label_text,
                 (x, max(y - 6, 12)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1, cv2.LINE_AA,
             )
-        elif status == STATUS_LOST and self._last_known_bbox != (0, 0, 0, 0):
-            x, y, w, h = self._last_known_bbox
+        elif spec.show_last_known:
+            x, y, w, h = spec.last_known_bbox
             cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 100), _BBOX_THICKNESS)
             cv2.putText(
-                vis, "SON KONUM",
+                vis,
+                spec.label_text,
                 (x, max(y - 6, 12)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1, cv2.LINE_AA,
             )
